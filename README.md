@@ -22,6 +22,8 @@ uv sync
 uv run scripts/XX-some_script.py
 ```
 
+Note that the scripts are [Jupytext percent notebooks](https://jupytext.readthedocs.io/en/latest/formats-scripts.html). They can be run as standard Python files, or run as interactive notebooks in [VS Code/Cursor](https://code.visualstudio.com/docs/python/jupyter-support-py) or PyCharm.
+
 ## Results
 
 > Train a neural network to 90% top-5 accuracy on CIFAR-100 using an NVIDIA H100.
