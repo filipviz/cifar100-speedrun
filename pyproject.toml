@@ -1,0 +1,19 @@
+[project]
+name = "cifar100-speedrun"
+version = "0.1.0"
+description = "Speedrunning the CIFAR-100 benchmark."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "einops>=0.8.1",
+    "ipykernel>=6.30.0",
+    "jaxtyping>=0.3.2",
+    "matplotlib>=3.10.3",
+    "numpy>=2.3.1",
+    "tabulate>=0.9.0",
+    "torch>=2.7.1",
+    "torchsummary>=1.5.1",
+    "torchvision>=0.22.1",
+    "tqdm>=4.67.1",
+    "wandb>=0.21.0",
+]
