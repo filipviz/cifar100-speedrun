@@ -4,15 +4,19 @@ import sys
 import os
 import uuid
 import subprocess
-from dataclasses import dataclass, field
-from typing import Literal
+from dataclasses import dataclass, field, fields, MISSING
+from typing import Literal, get_origin, get_args
 import logging
+import argparse
 
+from tabulate import tabulate
 import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.flop_counter import FlopCounterMode
+import numpy as np
+from einops import rearrange
 from torchvision.transforms import v2
 from torchvision.datasets import CIFAR100
 from tqdm import tqdm
@@ -44,27 +48,6 @@ Recognition*](https://arxiv.org/abs/1512.03385).
 - For shortcut connections where `c_in ≠ c_out`, either (a) pad with extra
   zeros and 2x2 pool/subsample the input tensor or (b) use a 1x1 convolution
   with `stride=2` for the shortcut connection.
-
-### ImageNet Implementation (Sec 3.4)
-
-- Resize with shorter side $\in [256, 480]$ for scale augmentation then take a
-  224x224 crop.
-- Random horizontal flipping, *per-pixel* mean subtracted, standard color
-  augmentation.
-- SGD with `momentum=0.9, weight_decay=1e-4`. 0.1 learning rate, divided by 10
-  when error plateaus. Trained for 60e4 iterations with a mini-batch size of
-  256. [He initialization](https://arxiv.org/abs/1502.01852), trained from
-  scratch.
-- No dropout.
-- Fully-convolutional form w/ 10-crop testing, with scores averaged across
-  scales (shorter side $\in \{224,256,384,480,640\}$).
-- See table 1 for architectural details at different scales.
-- Section 4.1 introduces more efficient bottleneck architectures. Rather than
-  using two consecutive 3x3 convolutions per block with a fixed number of
-  channels, they reduce the number of channels with a 1x1 convolution, apply a
-  3x3 convolution, then scale back up with another 1x1 convolution. These are
-  used in tandem with parameter-free residual connections for the
-  50/101/152-layer ResNets.
 
 ### CIFAR-10 Implementation (Sec 4.2)
 
@@ -108,20 +91,16 @@ DEVICE = 'cuda' if torch.cuda.is_available() else 'mps' if torch.mps.is_availabl
 # %% 2. Configuration and Hyperparameters
 
 @dataclass
-class ModelConfig:
-    """Model architecture configuration."""
-
+class Config:
+    
+    # --- Model architecture --- #
     num_classes: int = 100
     blocks_per_group: int = 9
     "This is n from sec. 4.2. We have 2n layers in each of our 3 groups."
     block_filters: list[int] = field(default_factory=lambda: [16, 32, 64])
     "Number of filters for each group. block_filters[0] is c_out for our input convolution."
-
-
-@dataclass
-class TrainConfig:
-    """Hyperparameters for our SGD optimizer and MultiStepLR scheduler."""
-
+    
+    # --- Training --- #
     train_steps: int = 64_000
     "Number of mini-batch iterations we train for."
     eval_every: int = 1_000
@@ -139,34 +118,25 @@ class TrainConfig:
     gamma: float = 0.1
     "MultiStepLR multiplier."
     device: Literal['cuda', 'mps', 'cpu'] = DEVICE
-    memory_format: torch.memory_format = torch.preserve_format if DEVICE == 'mps' else torch.channels_last
+    memory_format: Literal['preserve_format', 'channels_last'] = 'preserve_format' if DEVICE == 'mps' else 'channels_last'
     "Memory format for our model and data. channels_last improves convolution locality but causes crashes on mps."
     seed: int = 20250723
     "Set to 0 to disable seeding."
-
-
-@dataclass
-class LogConfig:
+    
+    # --- Logging --- #
     use_wandb: bool = False
     wandb_project: str | None = 'cifar100-speedrun'
     wandb_name: str | None = 'resnet{layers}'
-
-
-@dataclass
-class Config:
-    model: ModelConfig = field(default_factory=ModelConfig)
-    train: TrainConfig = field(default_factory=TrainConfig)
-    log: LogConfig = field(default_factory=LogConfig)
     
     def __post_init__(self):
         # 3 groups * 2n layers per group + 1 input layer + 1 output layer.
-        self.model.layers = 3 * self.model.blocks_per_group * 2 + 2
-        if self.log.use_wandb:
-            assert self.log.wandb_project is not None, "wandb_project is required"
-            assert self.log.wandb_name is not None, "wandb_name is required"
-            self.log.wandb_name = self.log.wandb_name.format(layers=self.model.layers)
+        self.layers = 3 * self.blocks_per_group * 2 + 2
+        if self.use_wandb:
+            assert self.wandb_project is not None, "wandb_project is required"
+            assert self.wandb_name is not None, "wandb_name is required"
+            self.wandb_name = self.wandb_name.format(layers=self.layers)
             
-        assert self.train.save_every % self.train.eval_every == 0, "save_every must be a multiple of eval_every"
+        assert self.save_every % self.eval_every == 0, "save_every must be a multiple of eval_every"
 
 # %% 3. Model
 
@@ -230,7 +200,7 @@ class BasicBlock(nn.Module):
 class ResNet(nn.Module):
     """A non-bottleneck ResNet as described in sec. 4.2"""
 
-    def __init__(self, cfg: ModelConfig) -> None:
+    def __init__(self, cfg: Config) -> None:
         super().__init__()
 
         # Input layer
@@ -276,28 +246,17 @@ class ResNet(nn.Module):
 # %% 4. Data Augmentation
 
 # Unusually, He et al 2015 normalizes with the per-pixel mean and without std.
-CIFAR100_MEAN_PATH = f"{DATA_DIR}/cifar_100_mean.pt"
+CIFAR100_MEAN_PATH = f"{DATA_DIR}/cifar_100_mean.npy"
 if not os.path.exists(CIFAR100_MEAN_PATH):
-
-    mean_transform = v2.Compose([
-        v2.ToImage(),
-        v2.ToDtype(torch.float32, scale=True),
-    ])
-
-    trainset = CIFAR100(
-        root=DATA_DIR,
-        train=True,
-        transform=mean_transform,
-        download=True
-    )
-
-    all_imgs = torch.stack([img for img, _ in trainset], device='cpu')
-    CIFAR100_MEAN = all_imgs.mean(dim=0)
-    torch.save(CIFAR100_MEAN, CIFAR100_MEAN_PATH)
-
+    np_mean = CIFAR100(root=DATA_DIR, train=True, download=True).data.mean(axis=0)
+    # Convert to PyTorch-friendly format: float32 scaled to [0, 1] in (C, H, W) format.
+    np_mean = np_mean.astype(np.float32) / 255.0
+    np_mean = rearrange(np_mean, "h w c -> c h w")
+    np.save(CIFAR100_MEAN_PATH, np_mean)
 else:
-    CIFAR100_MEAN = torch.load(CIFAR100_MEAN_PATH, map_location='cpu')
+    np_mean = np.load(CIFAR100_MEAN_PATH)
 
+CIFAR100_MEAN = torch.from_numpy(np_mean)
 
 train_transform = v2.Compose([
     v2.ToImage(),
@@ -318,8 +277,8 @@ test_transform = v2.Compose([
 class ResNetTrainer():
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        self.device = torch.device(cfg.train.device)
-        self.memory_format = cfg.train.memory_format
+        self.device = torch.device(cfg.device)
+        self.memory_format = torch.preserve_format if cfg.memory_format == 'preserve_format' else torch.channels_last
         
         if self.device.type == 'cuda':
             pin = True
@@ -329,14 +288,14 @@ class ResNetTrainer():
             pin = False
             workers = 0
         
-        if cfg.train.seed > 0:
-            generator = torch.Generator().manual_seed(cfg.train.seed)           
+        if cfg.seed > 0:
+            generator = torch.Generator().manual_seed(cfg.seed)           
         else:
             generator = None
 
         self.train_loader = DataLoader(
             CIFAR100(root=DATA_DIR, train=True, transform=train_transform, download=True),
-            batch_size=cfg.train.train_batch_size,
+            batch_size=cfg.train_batch_size,
             shuffle=True,
             num_workers=workers,
             persistent_workers=workers > 0,
@@ -346,41 +305,41 @@ class ResNetTrainer():
         )
         self.test_loader = DataLoader(
             CIFAR100(root=DATA_DIR, train=False, transform=test_transform, download=True),
-            batch_size=cfg.train.eval_batch_size,
+            batch_size=cfg.eval_batch_size,
             shuffle=False,
             num_workers=workers,
             drop_last=False,
             pin_memory=pin,
         )
 
-        self.model = ResNet(cfg.model).to(self.device, memory_format=self.memory_format)
+        self.model = ResNet(cfg).to(self.device, memory_format=self.memory_format)
         self.profile_model() # Profile before compilation.
 
         if self.device.type == 'cuda':
             # TODO: We have to warm up the compiled model.
             self.model = torch.compile(self.model, mode="max-autotune")
         
-        if self.cfg.log.use_wandb:
+        if self.cfg.use_wandb:
             wandb.init(
-                project=self.cfg.log.wandb_project,
-                name=self.cfg.log.wandb_name,
-                config=vars(self.cfg.model) | vars(self.cfg.train),
+                project=self.cfg.wandb_project,
+                name=self.cfg.wandb_name,
+                config=vars(self.cfg),
             )
             wandb.watch(self.model, log="all")
         
         self.opt = torch.optim.SGD(
             self.model.parameters(),
-            lr=cfg.train.initial_lr,
-            momentum=cfg.train.momentum,
-            weight_decay=cfg.train.weight_decay,
+            lr=cfg.initial_lr,
+            momentum=cfg.momentum,
+            weight_decay=cfg.weight_decay,
         )
         self.scheduler = torch.optim.lr_scheduler.MultiStepLR(
             self.opt,
-            milestones=cfg.train.milestones,
-            gamma=cfg.train.gamma,
+            milestones=cfg.milestones,
+            gamma=cfg.gamma,
         )
 
-        if self.cfg.train.save_every > 0:
+        if self.cfg.save_every > 0:
             os.makedirs("checkpoints", exist_ok=True)
         
     def profile_model(self):
@@ -391,9 +350,9 @@ class ResNetTrainer():
 
         logging.info(f"Model parameters: {sum(p.numel() for p in self.model.parameters())}")
 
-        bs = self.cfg.train.train_batch_size
+        bs = self.cfg.train_batch_size
         batch = torch.rand((bs, 3, 32, 32), device=self.device).to(memory_format=self.memory_format)
-        labels = torch.randint(0, self.cfg.model.num_classes, (bs,), device=self.device)
+        labels = torch.randint(0, self.cfg.num_classes, (bs,), device=self.device)
         
         flop_counter = FlopCounterMode(display=False)
         with flop_counter:
@@ -435,7 +394,7 @@ class ResNetTrainer():
             else torch.cpu.synchronize # No-op
         )
 
-        pbar = tqdm(range(1, self.cfg.train.train_steps+1), desc="Training")
+        pbar = tqdm(range(1, self.cfg.train_steps+1), desc="Training")
         total_time_seconds = 0.0
         starter.record()
 
@@ -460,21 +419,21 @@ class ResNetTrainer():
             # If we stepped here, we'd misreport the learning rate.
             
             # ---- Evaluation ---- #
-            last_step = step == self.cfg.train.train_steps
-            if last_step or self.cfg.train.eval_every > 0 and step % self.cfg.train.eval_every == 0:
+            last_step = step == self.cfg.train_steps
+            if last_step or self.cfg.eval_every > 0 and step % self.cfg.eval_every == 0:
                 ender.record()
                 synchronize()
                 total_time_seconds += 1e-3 * starter.elapsed_time(ender)
                 
-                if self.cfg.train.save_every > 0 and (
-                    last_step or step % self.cfg.train.save_every == 0
+                if self.cfg.save_every > 0 and (
+                    last_step or step % self.cfg.save_every == 0
                 ):
                     torch.save({
                         'model': self.model.state_dict(),
                         'optimizer': self.opt.state_dict(),
                         'scheduler': self.scheduler.state_dict(),
                         'step': step,
-                    }, f"checkpoints/resnet{self.cfg.model.layers}-{step}.pt")
+                    }, f"checkpoints/resnet{self.cfg.layers}-{step}.pt")
                 
                 self.model.eval()
                 test_metrics = self.evaluate()
@@ -492,7 +451,7 @@ class ResNetTrainer():
                 }
 
                 logging.info(ROW_FMT.format(*[metrics[col] for col in LOGGING_COLUMNS]))
-                if self.cfg.log.use_wandb:
+                if self.cfg.use_wandb:
                     metrics.pop('step')
                     wandb.log(metrics, step)
                 
@@ -532,22 +491,49 @@ class ResNetTrainer():
 
 # %%
 
+def parse_cfg() -> Config:
+    """Parse command-line arguments into a Config."""
+
+    def _default(f):
+        """Return the run-time default for a dataclass field, honouring default_factory."""
+        if f.default is not MISSING:
+            return f.default
+        if f.default_factory is not MISSING:
+            return f.default_factory()
+        return None
+
+    parser = argparse.ArgumentParser(description="Train a non-bottleneck ResNet on CIFAR-100.")
+    for f in fields(Config):
+        origin = get_origin(f.type)
+        if f.type in (int, float, str):
+            parser.add_argument(f"--{f.name}", type=f.type, default=_default(f))
+        elif f.type is bool:
+            parser.add_argument(f"--{f.name}", action=argparse.BooleanOptionalAction, default=_default(f))
+        elif origin is list:
+            elem_type = get_args(f.type)[0] if get_args(f.type) else str
+            parser.add_argument(f"--{f.name}", type=elem_type, nargs="+", default=_default(f))
+        else: # Fallback: treat as string.
+            parser.add_argument(f"--{f.name}", type=str, default=_default(f))
+
+    return Config(**vars(parser.parse_args()))
+
 if __name__ == "__main__":
     run_id = uuid.uuid4()
     os.makedirs(f"{BASE_DIR}/logs", exist_ok=True)
     logging.basicConfig(filename=f"{BASE_DIR}/logs/{run_id}.txt", format="%(message)s", level=logging.INFO)
+    
+    cfg = parse_cfg()
+    if cfg.seed > 0:
+        torch.cuda.manual_seed(cfg.seed)
+        torch.mps.manual_seed(cfg.seed)
+        torch.manual_seed(cfg.seed)
 
-    cfg = Config()
-    if cfg.train.seed > 0:
-        torch.cuda.manual_seed(cfg.train.seed)
-        torch.mps.manual_seed(cfg.train.seed)
-        torch.manual_seed(cfg.train.seed)
-
+    logging.info(tabulate(vars(cfg).items(), headers=["Config Field", "Value"]))
     logging.info(f"Running Python {sys.version}")
     logging.info(f"Running PyTorch {torch.version.__version__}")
-    if cfg.train.device == 'cuda':
+    if cfg.device == 'cuda':
         logging.info(f"Using CUDA {torch.version.cuda} and cuDNN {torch.backends.cudnn.version()}")
-    if cfg.train.device == 'mps':
+    if cfg.device == 'mps':
         release, _, machine = platform.mac_ver()
         logging.info(f"Using mps on MacOS {release} for {machine}.")
         
@@ -556,7 +542,7 @@ if __name__ == "__main__":
     logging.info(HEADER_FMT.format(*['---' for _ in LOGGING_COLUMNS]))
     trainer.train()
 
-    if cfg.train.device == 'cuda':
+    if cfg.device == 'cuda':
         smi = subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         logging.info(smi.stdout)
         logging.info(f"Max memory allocated: {torch.cuda.max_memory_allocated() // 1024**2} MiB")

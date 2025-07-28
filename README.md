@@ -33,7 +33,7 @@ Note that the scripts are [Jupytext percent notebooks](https://jupytext.readthed
 
 ## Baselines
 
-- [ ] [ResNet20, He et al 2015](https://arxiv.org/abs/1512.03385)
+- [ ] [ResNet, He et al 2015](https://arxiv.org/abs/1512.03385)
 - [ ] [`davidcpage/cifar10-fast`](https://github.com/davidcpage/cifar10-fast)
 - [ ] [`99991/cifar10-fast-simple`](https://github.com/99991/cifar10-fast-simple)
 - [ ] [`tysam-code/hlb-CIFAR10`](https://github.com/tysam-code/hlb-CIFAR10)
