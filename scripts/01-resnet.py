@@ -316,8 +316,8 @@ class ResNetTrainer():
         self.profile_model() # Profile before compilation.
 
         if self.device.type == 'cuda':
-            # TODO: We have to warm up the compiled model.
             self.model = torch.compile(self.model, mode="max-autotune")
+            self.warmup()
         
         if self.cfg.use_wandb:
             wandb.init(
@@ -378,7 +378,16 @@ class ResNetTrainer():
             torch.cuda.empty_cache()
         elif self.device.type == 'mps':
             torch.mps.empty_cache()
-        
+
+    def warmup(self):
+        """Warm up our compiled model."""
+        for _ in range(3):
+            bs = self.cfg.train_batch_size
+            batch = torch.rand((bs, 3, 32, 32), device=self.device).to(memory_format=self.memory_format)
+            labels = torch.randint(0, self.cfg.num_classes, (bs,), device=self.device)
+            out = self.model(batch)
+            loss = F.cross_entropy(out, labels)
+            loss.backward()
 
     def train(self) -> dict:
         self.model.train()
