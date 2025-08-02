@@ -26,7 +26,7 @@ Note that the scripts are [Jupytext percent notebooks](https://jupytext.readthed
 
 ## Results
 
-> Train a neural network to 90% top-5 accuracy on CIFAR-100 using an NVIDIA H100.
+> Train a neural network to 90% top-5 accuracy on CIFAR-100 using an NVIDIA H100 SXM.
 
 | Implementation | Source | Top-5/1 accuracy | Time | PFLOPs | Steps/Epochs |
 | -------------- | ------ | ---------------- | ---- | ------ | ------------ |

@@ -1,5 +1,6 @@
 
 # %%
+from datetime import datetime
 import platform
 import sys
 import os
@@ -16,11 +17,12 @@ from torch import nn, Tensor
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.flop_counter import FlopCounterMode
+from torch.profiler import profile, record_function
 import numpy as np
 from einops import einsum, rearrange
 from torchvision.transforms import v2
 from torchvision.datasets import CIFAR100
-from tqdm import tqdm
+from tqdm import tqdm, trange
 import wandb
 from jaxtyping import Float
 from tabulate import tabulate
@@ -85,10 +87,10 @@ CIFAR-100 has the same 32x32 format as CIFAR-10, so we can largely apply the non
 BASE_DIR = f"{os.path.dirname(__file__)}/.."
 DATA_DIR = f"{BASE_DIR}/data"
 
-LOGGING_COLUMNS = ['step', 'time', 'lr', 'train_loss', 'train_acc1',
+LOGGING_COLUMNS = ['step', 'time', 'iter_time', 'lr', 'train_loss', 'train_acc1',
                    'train_acc5', 'test_loss', 'test_acc1', 'test_acc5']
-HEADER_FMT = "|{:^6s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|"
-ROW_FMT = "|{:>6d}|{:>10.3f}|{:>10.3e}|{:>10.3f}|{:>10.3f}|{:>10.3f}|{:>10.3f}|{:>10.3f}|{:>10.3f}|"
+HEADER_FMT = "|{:^6s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|"
+ROW_FMT = "|{:>6d}|{:>10.3f}|{:>10.3f}|{:>10.3e}|{:>10.3f}|{:>10.3f}|{:>10.3f}|{:>10.3f}|{:>10.3f}|{:>10.3f}|"
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'mps' if torch.mps.is_available() else 'cpu'
 
@@ -106,7 +108,7 @@ class Config:
     "Number of filters for the layers in each group."
     group_bottlenecks: list[int] = field(default_factory=lambda: [32, 64, 128])
     "Bottleneck filters for the layers in each group. Ignored if bottleneck=False."
-    group_n_blocks: list[int] = field(default_factory=lambda: [3, 4, 6])
+    group_n_blocks: list[int] = field(default_factory=lambda: [4, 4, 4])
     "Number of blocks in each group."
     group_strides: list[int] = field(default_factory=lambda: [1, 2, 2])
     "Strides for the first convolution in each group. A stride of 2 halves the feature map size."
@@ -132,6 +134,7 @@ class Config:
     
     # --- Setup and Flags --- #
     count_flops: bool = True
+    profile: bool = True
     warmup_iters: int = 3
     "Set to 0 to disable warmup."
     float32_matmul_precision: Literal['highest', 'high', 'medium'] = 'high'
@@ -145,6 +148,7 @@ class Config:
     device: Literal['cuda', 'mps', 'cpu'] = DEVICE
     memory_format: Literal['preserve_format', 'channels_last'] = 'preserve_format' if DEVICE == 'mps' else 'channels_last'
     "Memory format for our model and data. channels_last improves convolution locality but causes crashes on mps."
+    n_workers: int = 12
     
     # --- Logging --- #
     use_wandb: bool = False
@@ -285,8 +289,8 @@ class BottleneckBlock(nn.Module):
         
     def forward(
         self,
-        x: Float[Tensor, "batch channel height width"]
-    ) -> Float[Tensor, "batch channel height width"]:
+        x: Float[Tensor, "batch c_in h_in w_in"]
+    ) -> Float[Tensor, "batch c_out h_out w_out"]:
         out = F.relu(self.bn1(self.conv1(x)), inplace=True)
         out = F.relu(self.bn2(self.conv2(out)), inplace=True)
         out = self.bn3(self.conv3(out)) + self.shortcut(x)
@@ -364,15 +368,15 @@ class ResNet(nn.Module):
     def extra_repr(self) -> str:
         return f"resnet{self.layers}-{'bottleneck' if self.bottleneck else ''}, shortcut={self.shortcut}"
 
-# %% 4. Data Augmentation
+# %% 4. Dataset and Augmentation
 
 # Unusually, He et al 2015 normalizes with the per-pixel mean and without std.
 CIFAR100_MEAN_PATH = f"{DATA_DIR}/cifar_100_mean.npy"
 if not os.path.exists(CIFAR100_MEAN_PATH):
     np_mean = CIFAR100(root=DATA_DIR, train=True, download=True).data.mean(axis=0)
     # Convert to PyTorch-friendly format: float32 scaled to [0, 1] in (C, H, W) format.
-    np_mean = np_mean.astype(np.float32) / 255.0
     np_mean = rearrange(np_mean, "h w c -> c h w")
+    np_mean = np_mean.astype(np.float32) / 255.0
     np.save(CIFAR100_MEAN_PATH, np_mean)
 else:
     np_mean = np.load(CIFAR100_MEAN_PATH)
@@ -446,14 +450,9 @@ class ResNetTrainer():
         self.memory_format = torch.preserve_format if cfg.memory_format == 'preserve_format' else torch.channels_last
         self.autocast_dtype = torch.bfloat16 if cfg.autocast_dtype == 'bf16' else torch.float32
         
-        # TODO: Experiment with different numbers of workers.
-        if self.device.type == 'cuda':
-            pin = True
-            n_workers = os.cpu_count()
-            assert n_workers is not None, "Could not determine number of CPUs with os.cpu_count()"
-        else:
-            pin = False
-            n_workers = 0
+        # mps crashes with more than one worker.
+        n_workers = cfg.n_workers if cfg.device != 'mps' else 0
+        pin = True if cfg.device != 'mps' else False
         
         if cfg.seed > 0:
             generator = torch.Generator().manual_seed(cfg.seed)           
@@ -475,6 +474,7 @@ class ResNetTrainer():
             batch_size=cfg.batch_size,
             shuffle=False,
             num_workers=n_workers,
+            persistent_workers=n_workers > 0, # Can disable if hitting memory limits.
             drop_last=False,
             pin_memory=pin,
         )
@@ -485,7 +485,6 @@ class ResNetTrainer():
 
         if self.device.type != 'mps':
             self.model = torch.compile(self.model, mode="max-autotune")
-            self.warmup(cfg.warmup_iters)
         
         if self.cfg.use_wandb:
             wandb.init(
@@ -493,19 +492,23 @@ class ResNetTrainer():
                 name=self.cfg.wandb_name,
                 config=vars(self.cfg),
             )
-            wandb.watch(self.model, log="all")
+            # wandb.watch(self.model, log="all")
         
         self.opt = torch.optim.SGD(
             self.model.parameters(),
             lr=cfg.initial_lr,
             momentum=cfg.momentum,
             weight_decay=cfg.weight_decay,
+            fused=True,
         )
         self.scheduler = torch.optim.lr_scheduler.MultiStepLR(
             self.opt,
             milestones=cfg.milestones,
             gamma=cfg.gamma,
         )
+
+        if cfg.profile:
+            self.profile()
 
         if self.cfg.save_every > 0:
             os.makedirs("checkpoints", exist_ok=True)
@@ -530,7 +533,7 @@ class ResNetTrainer():
         logging.info(f"{shape_str}, the forward pass incurs {flop_counter.get_total_flops()} FLOPs.")
         logging.info(flop_counter.get_table())
 
-        temp_opt = torch.optim.SGD(self.model.parameters(), lr=0.0)
+        temp_opt = torch.optim.SGD(self.model.parameters(), lr=0.0, fused=True)
         with flop_counter:
             with torch.autocast(device_type=self.device.type, dtype=self.autocast_dtype):
                 out = self.model(batch)
@@ -548,21 +551,41 @@ class ResNetTrainer():
         elif self.device.type == 'mps':
             torch.mps.empty_cache()
 
-    def warmup(self, iters: int):
-        """Warm up our compiled model."""
-        if iters == 0:
-            return
+    def profile(self):
+        """Profile our compiled model."""
+        def prof_callback(p):
+            logging.info(p.key_averages().table(sort_by="self_cuda_time_total"))
+            p.export_chrome_trace(f"logs/profile-{self.cfg.run_id}.json")
 
-        temp_opt = torch.optim.SGD(self.model.parameters(), lr=0.0)
-        for _ in range(iters):
-            bs = self.cfg.batch_size
-            batch = torch.rand((bs, 3, 32, 32), device=self.device).to(memory_format=self.memory_format)
-            labels = torch.randint(0, self.cfg.n_classes, (bs,), device=self.device)
-            with torch.autocast(device_type=self.device.type, dtype=self.autocast_dtype):
-                out = self.model(batch)
-                loss = F.cross_entropy(out, labels)
-            loss.backward()
-            temp_opt.zero_grad(set_to_none=True)
+        temp_opt = torch.optim.SGD(self.model.parameters(), lr=0.0, fused=True)
+
+        with profile(
+            schedule=torch.profiler.schedule(skip_first=10, wait=4, warmup=1, active=3, repeat=2),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+            on_trace_ready=prof_callback,
+        ) as prof:
+            with record_function("initialize_loader"):
+                loader_iter = iter(self.train_loader)
+
+            for _ in trange(26, desc="Profiling"):
+                with record_function("load_batch"):
+                    batch, labels = next(loader_iter)
+                    batch = batch.to(self.device, non_blocking=True, memory_format=self.memory_format)
+                    labels = labels.to(self.device, non_blocking=True)
+                
+                with record_function("forward"):
+                    with torch.autocast(device_type=self.device.type, dtype=self.autocast_dtype):
+                        out = self.model(batch)
+                        loss = F.cross_entropy(out, labels)
+                
+                with record_function("backward"):
+                    loss.backward()
+                    temp_opt.step()
+                    temp_opt.zero_grad(set_to_none=True)
+                
+                prof.step()
 
     def train(self) -> dict:
         self.model.train()
@@ -606,7 +629,8 @@ class ResNetTrainer():
             last_step = step == self.cfg.train_steps
             if last_step or self.cfg.eval_every > 0 and step % self.cfg.eval_every == 0:
                 synchronize()
-                training_time += time.perf_counter() - t0
+                iter_time = time.perf_counter() - t0
+                training_time += iter_time
                 
                 if self.cfg.save_every > 0 and (
                     last_step or step % self.cfg.save_every == 0
@@ -616,7 +640,7 @@ class ResNetTrainer():
                         'optimizer': self.opt.state_dict(),
                         'scheduler': self.scheduler.state_dict(),
                         'step': step,
-                    }, f"checkpoints/resnet{self.cfg.layers}-{step}.pt")
+                    }, f"checkpoints/run-{self.cfg.run_id}-step-{step}.pt")
                 
                 # Clone to avoid CUDA graph issues.
                 pred = pred.detach().clone()
@@ -629,6 +653,7 @@ class ResNetTrainer():
                 metrics = {
                     "step": step, 
                     "time": training_time,
+                    "iter_time": iter_time,
                     "lr": self.scheduler.get_last_lr()[0],
                     "train_loss": loss.item(),
                     "train_acc1": (pred.argmax(dim=1) == labels).float().mean().item() * 100,
@@ -722,7 +747,8 @@ if __name__ == "__main__":
         torch.manual_seed(cfg.seed) # seeds all devices
 
     # Set up logging
-    run_id = uuid.uuid4()
+    run_id = datetime.now().isoformat(timespec="seconds")
+    cfg.run_id = run_id
     os.makedirs(f"{BASE_DIR}/logs", exist_ok=True)
     logging.basicConfig(filename=f"{BASE_DIR}/logs/{run_id}.txt", format="%(message)s", level=logging.INFO)
     
@@ -735,7 +761,7 @@ if __name__ == "__main__":
     if cfg.device == 'mps':
         release, _, machine = platform.mac_ver()
         logging.info(f"Using mps on MacOS {release} for {machine}.")
-        
+    
     # Train our model
     trainer = ResNetTrainer(cfg)
     logging.info(HEADER_FMT.format(*LOGGING_COLUMNS))
