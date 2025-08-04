@@ -333,9 +333,78 @@ class ResNetTrainer:
         # Start the clock.
         torch.cuda.synchronize()
         t0 = time.perf_counter()
+        
+        for step in pbar:
+            # ---- Training ---- #
+            
+            # 1. Load our batch and labels.
+            try:
+                batch, labels = next(loader_iter)
+            except StopIteration:
+                loader_iter = iter(self.train_loader)
+                batch, labels = next(loader_iter)
+                
+            batch = batch.to(self.device, non_blocking=True, memory_format=torch.channels_last)
+            labels = labels.to(self.device, non_blocking=True)
+
+            # 2. Forward pass.
+            pred = self.model(batch)
+            loss = F.cross_entropy(pred, labels)
+
+            # 3. Backward pass.
+            self.opt.zero_grad(set_to_none=True)
+            loss.backward()
+            self.opt.step()
+
+            # We call scheduler.step() after evaluation.
+            # If we stepped here, we'd misreport the learning rate.
+            
+            # ---- Evaluation ---- #
+            last_step = step == self.cfg.train_steps
+            if last_step or self.cfg.eval_every > 0 and step % self.cfg.eval_every == 0:
+                torch.cuda.synchronize()
+                iter_time = time.perf_counter() - t0
+                training_time += iter_time
+                
+                # Save a checkpoint.
+                if self.cfg.save_every > 0 and (
+                    last_step or step % self.cfg.save_every == 0
+                ):
+                    torch.save({
+                        'model': self.model.state_dict(),
+                        'optimizer': self.opt.state_dict(),
+                        'scheduler': self.scheduler.state_dict(),
+                        'step': step,
+                    }, f"checkpoints/run-{self.cfg.run_id}-step-{step}.pt")
+                
+                self.model.eval()
+                test_metrics = self.evaluate()
+                self.model.train()
+                
+                # Our trainining metrics are only estimates (computed on a single batch).
+                metrics = {
+                    "step": step, 
+                    "time": training_time,
+                    "iter_time": iter_time,
+                    "lr": self.scheduler.get_last_lr()[0],
+                    "train_loss": loss.item(),
+                    "train_acc1": (pred.argmax(dim=1) == labels).float().mean().item() * 100,
+                    "train_acc5": (pred.topk(5)[1] == labels.view(-1, 1)).any(dim=1).float().mean().item() * 100,
+                    **test_metrics,
+                }
+                logging.info(ROW_FMT.format(*[metrics[col] for col in LOGGING_COLUMNS]))
+                pbar.set_postfix(train_loss=metrics['train_loss'], test_loss=metrics['test_loss'])
+                
+                # Start the clock again.
+                torch.cuda.synchronize()
+                t0 = time.perf_counter()
+
+            # 4. Update our learning rate.
+            self.scheduler.step()
 
         torch.cuda.synchronize()
-        t0 = time.perf_counter()
+        training_time += time.perf_counter() - t0
+        logging.info(f"Total training time: {training_time:,.2f}s")
     
     @torch.no_grad()
     def evaluate(self) -> dict[str, float]:
