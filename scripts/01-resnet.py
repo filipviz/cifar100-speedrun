@@ -1,6 +1,7 @@
 
 # %%
 from datetime import datetime
+import subprocess
 import sys
 import os
 import time
@@ -22,7 +23,9 @@ from tabulate import tabulate
 
 # %% [markdown]
 """
-A script which naively implements non-bottleneck ResNets based on [*Deep Residual Learning for Image Recognition*](https://arxiv.org/abs/1512.03385) for CIFAR-100.
+A script which naively implements non-bottleneck ResNets based on [*Deep
+Residual Learning for Image Recognition*](https://arxiv.org/abs/1512.03385) for
+CIFAR-100.
 
 ## Residual Blocks (Sec 3.2)
 
@@ -40,17 +43,21 @@ A script which naively implements non-bottleneck ResNets based on [*Deep Residua
   halved with `stride=2`, `c_out = 2 * c_in`.
 - Ends with global average pooling, a fully-connected layer, and softmax to
   produce logits.
-- For shortcut connections where `c_in ≠ c_out`, either (a) 2x2 pool/subsample the input tensor and pad with extra zeros or (b) use a 1x1 convolution with `stride=2` for the shortcut connection.
+- For shortcut connections where `c_in ≠ c_out`, either (a) 2x2 pool/subsample
+  the input tensor and pad with extra zeros or (b) use a 1x1 convolution with
+  `stride=2` for the shortcut connection.
 
 ## Non-Bottleneck Implementation for CIFAR-10 (Sec 4.2)
 
 - A 3x3 convolution is applied to the input. Then a stack of 6n 3x3 convolution
   layers with feature maps of sizes $\in \{32,16,8\}$ is applied, with
   `stride=2` for subsampling layers. They compare $n \in \{3,5,7,9\}$.
-- They use downsampling with zero-padding for the shortcut connections (option A from sec. 3.3).
+- They use downsampling with zero-padding for the shortcut connections (option
+  A from sec. 3.3).
 - Trained for 64k iterations with a mini-batch size of 128. 0.1 learning rate,
   divided by 10 after 32k and 48k iterations.
-- Train-time augmentation: 4 pixels padded on each side, with a 32x32 crop sampled from the image or its horizontal flip. *Per-pixel* mean subtracted.
+- Train-time augmentation: 4 pixels padded on each side, with a 32x32 crop
+  sampled from the image or its horizontal flip. *Per-pixel* mean subtracted.
 - No test-time augmentation.
 - They also explore a deeper ResNet with `n=18`. To assist convergence they use
   `lr=0.01` to warm up for 400 iterations. An `n=200` network also converges,
@@ -59,7 +66,7 @@ A script which naively implements non-bottleneck ResNets based on [*Deep Residua
 
 ## Our Implementation
 
-We're ignoring *many* easy optimizations to prioritize faithfulness to the paper. We do deviate slightly by allowing tf32 convolutions and matmuls, which allow us to take advantage of the H100's tensor cores with only a marginal loss in accuracy.
+We're ignoring *many* straightforward optimizations in order to faithfully implement the paper. We do deviate slightly by allowing tf32 convolutions and matmuls, which allow us to take advantage of the H100's tensor cores with only a marginal loss in accuracy.
 """
 
 # %% 1. Global Constants
@@ -72,7 +79,7 @@ DATA_DIR = f"{BASE_DIR}/data"
 LOGGING_COLUMNS = ['step', 'time', 'iter_time', 'lr', 'train_loss', 'train_acc1',
                    'train_acc5', 'test_loss', 'test_acc1', 'test_acc5']
 HEADER_FMT = "|{:^6s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|"
-ROW_FMT = "|{:>6d}|{:>10.3f}|{:>10.3f}|{:>10.3e}|{:>10.3f}|{:>10.3f}|{:>10.3f}|{:>10.3f}|{:>10.3f}|{:>10.3f}|"
+ROW_FMT = "|{:>6d}|{:>10,.3f}|{:>10,.3f}|{:>10,.3e}|{:>10,.3f}|{:>10.3%}|{:>10.3%}|{:>10,.3f}|{:>10.3%}|{:>10.3%}|"
 
 # %% 2. Configuration and Hyperparameters
 
@@ -187,7 +194,7 @@ class ResNet(nn.Module):
         super().__init__()
 
         # Input layer
-        self.conv1 = nn.Conv2d(3, cfg.input_conv_filters, 3, 1, bias=False)
+        self.conv1 = nn.Conv2d(3, cfg.input_conv_filters, 3, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(cfg.input_conv_filters)
 
         self.groups = nn.Sequential(*[
@@ -202,8 +209,7 @@ class ResNet(nn.Module):
         else:
             c_out = cfg.group_c_ins[-1]
 
-        # self.pool = nn.AdaptiveAvgPool2d(1)
-        self.pool = nn.AvgPool2d(8)
+        self.pool = nn.AdaptiveAvgPool2d(1)
         self.fc = nn.Linear(c_out, cfg.n_classes)
         
         self.apply(self._init_weights)
@@ -251,23 +257,28 @@ else:
 
 CIFAR100_MEAN = torch.from_numpy(np_mean)
 
+@torch.compile(mode='max-autotune')
+def sub_mean(x: Float[Tensor, "channel height width"]) -> Float[Tensor, "channel height width"]:
+    """Subtract the per-pixel mean."""
+    return x - CIFAR100_MEAN
+
 train_transform = v2.Compose([
     v2.ToImage(),
     v2.RandomCrop(32, padding=4),
     v2.RandomHorizontalFlip(),
     v2.ToDtype(torch.float32, scale=True),
-    v2.Lambda(lambda x: x - CIFAR100_MEAN),
+    v2.Lambda(sub_mean),
 ])
 
 test_transform = v2.Compose([
     v2.ToImage(),
     v2.ToDtype(torch.float32, scale=True),
-    v2.Lambda(lambda x: x - CIFAR100_MEAN),
+    v2.Lambda(sub_mean),
 ])
 
 # %% 5. Trainer
 
-class ResNetTrainer():
+class ResNetTrainer:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.device = torch.device("cuda")
@@ -312,7 +323,7 @@ class ResNetTrainer():
         if self.cfg.save_every > 0:
             os.makedirs("checkpoints", exist_ok=True)
 
-    def train(self) -> dict:
+    def train(self):
         self.model.train()
 
         loader_iter = iter(self.train_loader)
@@ -323,77 +334,8 @@ class ResNetTrainer():
         torch.cuda.synchronize()
         t0 = time.perf_counter()
 
-        for step in pbar:
-            # ---- Training ---- #
-            
-            # 1. Load our batch and labels.
-            try:
-                batch, labels = next(loader_iter)
-            except StopIteration:
-                loader_iter = iter(self.train_loader)
-                batch, labels = next(loader_iter)
-                
-            batch = batch.to(self.device, non_blocking=True, memory_format=torch.channels_last)
-            labels = labels.to(self.device, non_blocking=True)
-
-            # 2. Forward pass.
-            pred = self.model(batch)
-            loss = F.cross_entropy(pred, labels)
-
-            # 3. Backward pass.
-            self.opt.zero_grad(set_to_none=True)
-            loss.backward()
-            self.opt.step()
-
-            # We call scheduler.step() after evaluation.
-            # If we stepped here, we'd misreport the learning rate.
-            
-            # ---- Evaluation ---- #
-            last_step = step == self.cfg.train_steps
-            if last_step or self.cfg.eval_every > 0 and step % self.cfg.eval_every == 0:
-                torch.cuda.synchronize()
-                iter_time = time.perf_counter() - t0
-                training_time += iter_time
-                
-                # Save a checkpoint.
-                if self.cfg.save_every > 0 and (
-                    last_step or step % self.cfg.save_every == 0
-                ):
-                    torch.save({
-                        'model': self.model.state_dict(),
-                        'optimizer': self.opt.state_dict(),
-                        'scheduler': self.scheduler.state_dict(),
-                        'step': step,
-                    }, f"checkpoints/run-{self.cfg.run_id}-step-{step}.pt")
-                
-                self.model.eval()
-                test_metrics = self.evaluate()
-                self.model.train()
-                
-                # Our trainining metrics are only estimates (computed on a single batch).
-                metrics = {
-                    "step": step, 
-                    "time": training_time,
-                    "iter_time": iter_time,
-                    "lr": self.scheduler.get_last_lr()[0],
-                    "train_loss": loss.item(),
-                    "train_acc1": (pred.argmax(dim=1) == labels).float().mean().item() * 100,
-                    "train_acc5": (pred.topk(5)[1] == labels.view(-1, 1)).any(dim=1).float().mean().item() * 100,
-                    **test_metrics,
-                }
-                logging.info(ROW_FMT.format(*[metrics[col] for col in LOGGING_COLUMNS]))
-                pbar.set_postfix(train_loss=metrics['train_loss'], test_loss=metrics['test_loss'])
-                
-                # Start the clock again.
-                torch.cuda.synchronize()
-                t0 = time.perf_counter()
-
-            # 4. Update our learning rate.
-            self.scheduler.step()
-            
         torch.cuda.synchronize()
-        training_time += time.perf_counter() - t0
-        logging.info(f"Total training time: {training_time:.2f}s")
+        t0 = time.perf_counter()
     
     @torch.no_grad()
     def evaluate(self) -> dict[str, float]:
@@ -415,8 +357,8 @@ class ResNetTrainer():
             
         return {
             "test_loss": cum_loss.item() / items,
-            "test_acc1": n_correct_top1.item() / items * 100,
-            "test_acc5": n_correct_top5.item() / items * 100,
+            "test_acc1": n_correct_top1.item() / items,
+            "test_acc5": n_correct_top5.item() / items,
         }
 
 # %%
@@ -442,7 +384,7 @@ if __name__ == "__main__":
     logging.info(f"{run_id=}")
     logging.info(f"Running Python {sys.version} and PyTorch {torch.version.__version__}")
     logging.info(f"Running CUDA {torch.version.cuda} and cuDNN {torch.backends.cudnn.version()}")
-    logging.info(f"Using {torch.cuda.get_device_name()}")
+    logging.info(torch.cuda.get_device_name())
     logging.info(tabulate(vars(cfg).items(), headers=["Config Field", "Value"]))
     
     # Train our model
@@ -450,6 +392,11 @@ if __name__ == "__main__":
     logging.info(HEADER_FMT.format(*LOGGING_COLUMNS))
     logging.info(HEADER_FMT.format(*['---' for _ in LOGGING_COLUMNS]))
     trainer.train()
+    
+    smi = subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    logging.info(smi.stdout)
+    logging.info(f"Max memory allocated: {torch.cuda.max_memory_allocated() // 1024**2:,} MiB")
+    logging.info(f"Max memory reserved: {torch.cuda.max_memory_reserved() // 1024**2:,} MiB")
     
     # Write this source code to our logs.
     with open(sys.argv[0]) as f:
