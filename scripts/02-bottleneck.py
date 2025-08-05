@@ -83,15 +83,17 @@ class Config:
     "Set to 0 to disable evaluation."
     save_every: int = 16_000
     "Set to 0 to disable checkpointing. Must be a multiple of eval_every."
-    batch_size: int = 256
+    batch_size: int = 128
     initial_lr: float = 0.1
     momentum: float = 0.9
     "SGD momentum (not BatchNorm momentum)."
     weight_decay: float = 1e-4
     gamma: float = 0.1
     "ReduceLROnPlateau multiplier."
-    patience: int = 3
-    "If our validation loss plateaus for this many eval cycles, we scale the learning rate by gamma."
+    patience: int = 1
+    "If our test_acc5 plateaus for this many eval cycles, we scale the learning rate by gamma."
+    threshold: float = 0.005
+    "How much our test_acc5 must improve to not be considered plateauing."
     
     # --- Setup and Flags --- #
     allow_tf32: bool = True
@@ -134,7 +136,7 @@ class BottleneckBlock(nn.Module):
         self.conv3 = nn.Conv2d(c_bottleneck, c_out, kernel_size=1, bias=False)
         self.bn3 = nn.BatchNorm2d(c_out)
         
-        self.downsample = c_out != c_in
+        self.downsample = c_out != c_in or stride != 1
         # Option B from sec. 3.3: use a 1x1 convolution with stride=2.
         self.shortcut = nn.Sequential(
             nn.Conv2d(c_in, c_out, kernel_size=1, stride=stride, bias=False),
@@ -182,7 +184,9 @@ class BottleneckResNet(nn.Module):
         stride: int,
         n_blocks: int,
     ) -> nn.Sequential:
-        c_bottleneck = c_out // self.bottleneck_factor
+        c_bottleneck, mod = divmod(c_out, self.bottleneck_factor)
+        assert mod == 0, "c_out must be divisible by bottleneck_factor"
+
         group = [BottleneckBlock(c_in, c_out, c_bottleneck, stride)]
         for _ in range(1, n_blocks):
             group.append(BottleneckBlock(c_out, c_out, c_bottleneck, 1))
@@ -237,7 +241,6 @@ else:
 EIGENVALUES = torch.from_numpy(eigenvalues).to(torch.float32)
 EIGENVECTORS = torch.from_numpy(eigenvectors).to(torch.float32)
 
-@torch.compile(mode='max-autotune')
 def pca_aug_and_norm(x: Float[Tensor, "channel height width"]) -> Float[Tensor, "channel height width"]:
     """Apply PCA color augmentation and subtract the mean."""
     c, h, w = x.shape
@@ -255,7 +258,6 @@ train_transform = v2.Compose([
     v2.Lambda(pca_aug_and_norm),
 ])
 
-@torch.compile(mode='max-autotune')
 def sub_mean(x: Float[Tensor, "channel height width"]) -> Float[Tensor, "channel height width"]:
     """Subtract the per-pixel mean."""
     return x - CIFAR100_MEAN
@@ -283,7 +285,7 @@ class BottleneckTrainer:
             shuffle=True,
             num_workers=cfg.n_workers,
             persistent_workers=cfg.n_workers > 0,
-            drop_last=False,
+            drop_last=True,
             pin_memory=True,
             generator=generator,
         )
@@ -311,6 +313,7 @@ class BottleneckTrainer:
             mode="max",
             factor=cfg.gamma,
             patience=cfg.patience,
+            threshold=cfg.threshold,
         )
 
         if self.cfg.save_every > 0:
@@ -383,7 +386,11 @@ class BottleneckTrainer:
                     **test_metrics,
                 }
                 logging.info(ROW_FMT.format(*[metrics[col] for col in LOGGING_COLUMNS]))
-                pbar.set_postfix(train_loss=metrics['train_loss'], test_loss=metrics['test_loss'])
+                pbar.set_postfix(
+                    train_loss=metrics['train_loss'],
+                    test_loss=metrics['test_loss'],
+                    lr=f"{self.scheduler.get_last_lr()[0]:.2e}",
+                )
                 
                 # Start the clock again.
                 torch.cuda.synchronize()
@@ -399,6 +406,7 @@ class BottleneckTrainer:
 
     @torch.no_grad()
     def evaluate(self) -> dict[str, float]:
+        assert not self.model.training, "Model must be in eval mode"
         items = len(self.test_loader.dataset)
         cum_loss = torch.tensor(0.0, device="cuda")
         n_correct_top1 = torch.tensor(0.0, device="cuda")

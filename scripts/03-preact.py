@@ -1,4 +1,3 @@
-
 # %%
 from datetime import datetime
 import subprocess
@@ -23,50 +22,16 @@ from tabulate import tabulate
 
 # %% [markdown]
 """
-A script which naively implements non-bottleneck ResNets based on [*Deep
-Residual Learning for Image Recognition*](https://arxiv.org/abs/1512.03385) for
-CIFAR-100.
+In this script, we implement the pre-activation ResNet architecture as described in [*Identity Mappings in Deep Residual Networks*](https://arxiv.org/abs/1603.05027). Rather than convolution -> batchnorm -> ReLU, we use batchnorm -> ReLU -> convolution.
 
-## Residual Blocks (Sec 3.2)
+The relevant details are in the appendix:
+- They largely follow the [non-bottleneck architecture](./01-resnet.py) from [He et al 2015](https://arxiv.org/abs/1512.03385).
+- They only use translation/flipping augmentation for training. (Do they not use normalization?)
+- They use a warmup learning rate of 0.01 for the first 400 steps, then use 0.1. They divide the learning rate by 10 at 32k and 48k steps.
+- Mini-batch size of 128, 1e-4 weight decay, SGD momentum of 0.9.
+- They apply BN + ReLU in the input convolution stem (before splitting into two paths). They apply an extra BN + ReLU after the elementwise addition in the last block (before pooling + fully-connected layer).
 
-- They use $\mathbf y = \mathcal F(\mathbf x, \{W_i\}) + \mathbf x$. The
-  dimensions of $\mathbf x$ and $\mathcal F$ must be equal. If this is not the
-  case, we can perform a linear projection $W_s$ by the shortcut connections to
-  match the dimension.
-- A non-linearity (ReLU) is applied after the addition.
-- $\mathcal F$ is flexible, and generally has two or three layers.
-
-## Network Architecture (Sec 3.3)
-
-- Convolutions use 3x3 filters with `padding=1`.
-- `c_out = c_in` when feature map size stays constant. When feature map size is
-  halved with `stride=2`, `c_out = 2 * c_in`.
-- Ends with global average pooling, a fully-connected layer, and softmax to
-  produce logits.
-- For shortcut connections where `c_in ≠ c_out`, either (a) 2x2 pool/subsample
-  the input tensor and pad with extra zeros or (b) use a 1x1 convolution with
-  `stride=2` for the shortcut connection.
-
-## Non-Bottleneck Implementation for CIFAR-10 (Sec 4.2)
-
-- A 3x3 convolution is applied to the input. Then a stack of 6n 3x3 convolution
-  layers with feature maps of sizes $\in \{32,16,8\}$ is applied, with
-  `stride=2` for subsampling layers. They compare $n \in \{3,5,7,9\}$.
-- They use downsampling with zero-padding for the shortcut connections (option
-  A from sec. 3.3).
-- Trained for 64k iterations with a mini-batch size of 128. 0.1 learning rate,
-  divided by 10 after 32k and 48k iterations.
-- Train-time augmentation: 4 pixels padded on each side, with a 32x32 crop
-  sampled from the image or its horizontal flip. *Per-pixel* mean subtracted.
-- No test-time augmentation.
-- They also explore a deeper ResNet with `n=18`. To assist convergence they use
-  `lr=0.01` to warm up for 400 iterations. An `n=200` network also converges,
-  but overfits and has worse test accuracy.
-- Otherwise mirrors the ImageNet implementation.
-
-## Our Implementation
-
-We're ignoring *many* straightforward optimizations in order to faithfully implement the paper. We do deviate slightly by allowing tf32 convolutions and matmuls, which allow us to take advantage of the H100's tensor cores with only a marginal loss in accuracy.
+Readers may also be interested in [Kaiming He's implementation](https://github.com/KaimingHe/resnet-1k-layers).
 """
 
 # %% 1. Global Constants
@@ -113,6 +78,10 @@ class Config:
     "MultiStepLR milestones."
     gamma: float = 0.1
     "MultiStepLR multiplier."
+    warmup_steps: int = 400
+    "Number of steps for the warmup learning rate."
+    warmup_lr: float = 0.01
+    "Warmup learning rate."
     
     # --- Setup and Flags --- #
     allow_tf32: bool = True
@@ -133,11 +102,9 @@ class Config:
 
 # %% 3. Model
 
-class BasicBlock(nn.Module):
+class PreActBlock(nn.Module):
     """
-    A ResNet building block as described in sec. 3.2. Two Conv2d -> BatchNorm2d
-    -> ReLU sequences with a parameter-free residual connection (option A from
-    sec. 4.1). In downsampling blocks, we use stride=2 and c_out = 2 * c_in.
+    A pre-activation ResNet building block as described in He et al 2016 sec. 4.1.
 
     Args:
         c_in: Number of input channels.
@@ -151,16 +118,16 @@ class BasicBlock(nn.Module):
         downsample: bool,
     ) -> None:
         super().__init__()
-
+        
         self.c_out = c_out = 2 * c_in if downsample else c_in
         stride = 2 if downsample else 1
 
+        self.bn1 = nn.BatchNorm2d(c_in)
         self.conv1 = nn.Conv2d(c_in, c_out, 3, stride=stride, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(c_out)
 
-        self.conv2 = nn.Conv2d(c_out, c_out, 3, stride=1, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(c_out)
-        
+        self.conv2 = nn.Conv2d(c_out, c_out, 3, stride=1, padding=1, bias=False)
+
         if downsample:
             # Parameter-free shortcut (Option A from sec. 3.3).
             pad_chs = c_out - c_in
@@ -181,14 +148,15 @@ class BasicBlock(nn.Module):
         If this is a downsampling block, c_out = 2*c_in and h_out/w_out are
         half of h_in/w_in respectively. Otherwise, they all match.
         """
-        out = self.bn1(self.conv1(x))
-        out = F.relu(out, inplace=True)
-        out = self.bn2(self.conv2(out)) + self.shortcut(x)
-        out = F.relu(out, inplace=True)
+        out = F.relu(self.bn1(x), inplace=True)
+        out = self.conv1(out)
+        out = F.relu(self.bn2(out), inplace=True)
+        out = self.conv2(out)
+        out = out + self.shortcut(x)
         return out
 
-class ResNet(nn.Module):
-    """A non-bottleneck ResNet as described in sec. 4.2."""
+class PreActResNet(nn.Module):
+    """A pre-activation ResNet as described in He et al 2016."""
 
     def __init__(self, cfg: Config) -> None:
         super().__init__()
@@ -204,8 +172,9 @@ class ResNet(nn.Module):
         ])
         
         # Output layer
-        self.pool = nn.AdaptiveAvgPool2d(1)
         c_out = self.groups[-1][-1].c_out
+        self.bn2 = nn.BatchNorm2d(c_out)
+        self.pool = nn.AdaptiveAvgPool2d(1)
         self.fc = nn.Linear(c_out, cfg.n_classes)
         
         self.apply(self._init_weights)
@@ -216,9 +185,9 @@ class ResNet(nn.Module):
         downsample: bool,
         n_blocks: int,
     ) -> nn.Sequential:
-        group = [BasicBlock(c_in, downsample)]
+        group = [PreActBlock(c_in, downsample)]
         for _ in range(1, n_blocks):
-            group.append(BasicBlock(group[-1].c_out, False))
+            group.append(PreActBlock(group[-1].c_out, False))
 
         return nn.Sequential(*group)
     
@@ -235,12 +204,14 @@ class ResNet(nn.Module):
     ) -> Float[Tensor, "batch n_classes"]:
         out = F.relu(self.bn1(self.conv1(x)), inplace=True)
         out = self.groups(out)
+        out = F.relu(self.bn2(out), inplace=True)
         out = self.pool(out).flatten(start_dim=1)
         return self.fc(out)
 
 # %% 4. Dataset and Augmentation
 
 # Unusually, He et al 2015 normalizes with the per-pixel mean and without std.
+# Although it isn't explicitly stated in He et al 2016, we can assume it's the same.
 CIFAR100_MEAN_PATH = f"{DATA_DIR}/cifar_100_mean.npy"
 if not os.path.exists(CIFAR100_MEAN_PATH):
     np_mean = CIFAR100(root=DATA_DIR, train=True, download=True).data.mean(axis=0)
@@ -253,27 +224,23 @@ else:
 
 CIFAR100_MEAN = torch.from_numpy(np_mean)
 
-def sub_mean(x: Float[Tensor, "channel height width"]) -> Float[Tensor, "channel height width"]:
-    """Subtract the per-pixel mean."""
-    return x - CIFAR100_MEAN
-
 train_transform = v2.Compose([
     v2.ToImage(),
     v2.RandomCrop(32, padding=4),
     v2.RandomHorizontalFlip(),
     v2.ToDtype(torch.float32, scale=True),
-    v2.Lambda(sub_mean),
+    v2.Lambda(lambda x: x - CIFAR100_MEAN),
 ])
 
 test_transform = v2.Compose([
     v2.ToImage(),
     v2.ToDtype(torch.float32, scale=True),
-    v2.Lambda(sub_mean),
+    v2.Lambda(lambda x: x - CIFAR100_MEAN),
 ])
 
 # %% 5. Trainer
 
-class ResNetTrainer:
+class PreActTrainer:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.device = torch.device("cuda")
@@ -300,7 +267,7 @@ class ResNetTrainer:
             pin_memory=True,
         )
 
-        self.model = ResNet(cfg).to(self.device, memory_format=torch.channels_last)
+        self.model = PreActResNet(cfg).to(self.device, memory_format=torch.channels_last)
 
         self.opt = torch.optim.SGD(
             self.model.parameters(),
@@ -309,10 +276,21 @@ class ResNetTrainer:
             weight_decay=cfg.weight_decay,
             fused=True,
         )
-        self.scheduler = torch.optim.lr_scheduler.MultiStepLR(
+        
+        warmup = torch.optim.lr_scheduler.ConstantLR(
             self.opt,
-            milestones=cfg.milestones,
+            factor=cfg.warmup_lr / cfg.initial_lr,
+            total_iters=cfg.warmup_steps,
+        )
+        multistep = torch.optim.lr_scheduler.MultiStepLR(
+            self.opt,
+            milestones=[m - cfg.warmup_steps for m in cfg.milestones],
             gamma=cfg.gamma,
+        )
+        self.scheduler = torch.optim.lr_scheduler.SequentialLR(
+            self.opt,
+            schedulers=[warmup, multistep],
+            milestones=[cfg.warmup_steps],
         )
 
         if self.cfg.save_every > 0:
@@ -450,7 +428,7 @@ if __name__ == "__main__":
     logging.info(tabulate(vars(cfg).items(), headers=["Config Field", "Value"]))
     
     # Train our model
-    trainer = ResNetTrainer(cfg)
+    trainer = PreActTrainer(cfg)
     logging.info(HEADER_FMT.format(*LOGGING_COLUMNS))
     logging.info(HEADER_FMT.format(*['---' for _ in LOGGING_COLUMNS]))
     trainer.train()
