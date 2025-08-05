@@ -33,9 +33,15 @@ Note that the scripts are [Jupytext percent notebooks](https://jupytext.readthed
 
 ## Baselines
 
-- [ ] [ResNet, He et al 2015](https://arxiv.org/abs/1512.03385)
+- [x] [ResNet, He et al 2015](https://arxiv.org/abs/1512.03385)
+- [x] [Pre-activation Resnet, He et al 2016](https://arxiv.org/abs/1603.05027)
 - [ ] [`davidcpage/cifar10-fast`](https://github.com/davidcpage/cifar10-fast)
 - [ ] [`99991/cifar10-fast-simple`](https://github.com/99991/cifar10-fast-simple)
 - [ ] [`tysam-code/hlb-CIFAR10`](https://github.com/tysam-code/hlb-CIFAR10)
 - [ ] [Jordan, 2024](https://arxiv.org/abs/2404.00498)
 - [ ] [`KellerJordan/cifar10-airbench`](https://github.com/KellerJordan/cifar10-airbench)
+
+Also see:
+- [Wide Residual Networks](https://arxiv.org/abs/1605.07146)
+- [ResNeXt](https://arxiv.org/abs/1611.05431)
+- [ConvNeXt](https://arxiv.org/abs/2201.03545)

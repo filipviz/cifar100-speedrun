@@ -19,24 +19,45 @@ from torchvision.datasets import CIFAR100
 from tqdm import tqdm
 from jaxtyping import Float
 from tabulate import tabulate
+import wandb
 
 # %% [markdown]
 """
-In this script, we implement the pre-activation ResNet architecture as described in [*Identity Mappings in Deep Residual Networks*](https://arxiv.org/abs/1603.05027). Rather than convolution -> batchnorm -> ReLU, we use batchnorm -> ReLU -> convolution.
+In this script, we implement the baseline ResNet described in [*How to Train Your ResNet 1: Baseline*](https://web.archive.org/web/20221206112356/https://myrtle.ai/how-to-train-your-resnet-1-baseline/).
 
-The relevant details are in the appendix:
-- They largely follow the [non-bottleneck architecture](./01-resnet.py) from [He et al 2015](https://arxiv.org/abs/1512.03385).
-- They only use translation/flipping augmentation for training.
-- They use a warmup learning rate of 0.01 for the first 400 steps, then use 0.1. They divide the learning rate by 10 at 32k and 48k steps.
-- Mini-batch size of 128, 1e-4 weight decay, SGD momentum of 0.9.
-- They apply BN + ReLU in the input convolution stem (before splitting into two paths). They apply an extra BN + ReLU after the elementwise addition in the last block (before pooling + fully-connected layer).
+Since we're starting to make more opinionated and idiosyncratic changes, we'll add wandb logging to more easily compare results across runs.
 
-Readers may also be interested in [Kaiming He's implementation](https://github.com/KaimingHe/resnet-1k-layers).
+It's based on Ben Johnson's DAWNBench submission, which:
+- Is an 18-layer pre-activation ResNet.
+- Uses 64 -> 128 -> 256 -> 512 channels. Much shallower and wider than the original ResNet.
+- Uses 1x1 convolutions for downsampling shortcuts.
+- Uses four groups with 2 blocks each. The first is not a downsampling group, and the rest are (meaning we apply 4x4 mean pooling at the end).
+- Uses typical mean/std normalization rather than per-pixel mean alone (as in He et al 2015).
+- Uses a somewhat odd learning rate schedule with a long linear warmup, long linear decay, and a few small jumps.
+- Uses mixed-precision training.
+
+Oddly, they apply the first batchnorm + ReLU to both the residual stream and the convolution path (which performs worse). It doesn't make a huge difference for a network this shallow, but I won't do this.
+
+Page makes the following changes:
+- Removes the batchnorm + ReLU from the input stem, since they're redundant with the batchnorm + ReLU in the first residual block.
+- Removes some of the jumps in the learning rate schedule.
+- Preprocesses the dataset in advance. Rather than applying padding, normalization, and random horizontal flipping each time they load a batch, he pre-applies these. This leaves only random cropping and flipping.
+- He removes dataworkers to avoid the overhead associated with launching them. Keeping everything in the main thread saves time!
+
+TODO:
+- Replicate learning rate schedule from notebook.
+- Preprocess the dataset.
+- Mixed-precision training.
+- Remove dataloader workers (everything in main thread).
+- Combine random number calls into bulk calls up front (how did he do this?).
+
+[article](https://web.archive.org/web/20221206112356/https://myrtle.ai/how-to-train-your-resnet-1-baseline/)
+[notebook](https://github.com/davidcpage/cifar10-fast/blob/master/experiments.ipynb)
 """
 
 # %% 1. Global Constants
 
-assert torch.cuda.is_available(), "This script requires a CUDA-enabled GPU."
+# assert torch.cuda.is_available(), "This script requires a CUDA-enabled GPU."
 
 BASE_DIR = f"{os.path.dirname(__file__)}/.."
 DATA_DIR = f"{BASE_DIR}/data"
@@ -53,13 +74,13 @@ class Config:
     
     # --- Model architecture --- #
     n_classes: int = 100
-    input_conv_filters: int = 16
+    input_conv_filters: int = 64
     "c_out for the convolution applied to the input."
-    group_c_ins: list[int] = field(default_factory=lambda: [16, 16, 32])
+    group_c_ins: list[int] = field(default_factory=lambda: [64, 64, 128, 256])
     "c_in for the first convolution in each group."
-    group_downsample: list[bool] = field(default_factory=lambda: [False, True, True])
+    group_downsample: list[bool] = field(default_factory=lambda: [False, True, True, True])
     "Whether the first block in each group downsamples the feature map size and doubles the number of channels."
-    group_n_blocks: list[int] = field(default_factory=lambda: [9, 9, 9])
+    group_n_blocks: list[int] = field(default_factory=lambda: [2, 2, 2, 2])
     "Number of blocks in each group."
     
     # --- Training --- #
@@ -88,13 +109,21 @@ class Config:
     cudnn_benchmark: bool = True
     cudnn_deterministic: bool = False
     float32_matmul_precision: Literal['highest', 'high', 'medium'] = 'high'
-    seed: int = 20250805
+    seed: int = 20250802
     "Set to 0 to disable seeding."
     n_workers: int = 12
+
+    # --- wandb --- #
+    wandb_project: str | None = None
+    wandb_name: str | None = None
+    use_wandb: bool = False
     
     def __post_init__(self):
         assert len(self.group_c_ins) == len(self.group_n_blocks) == len(self.group_downsample)
         assert self.save_every % self.eval_every == 0, "save_every must be a multiple of eval_every"
+
+        if self.use_wandb:
+            assert self.wandb_project and self.wandb_name, "must set wandb_project and wandb_name if use_wandb is True"
 
         # block layers + 1 input layer + 1 output layer.
         self.layers = 2 * sum(self.group_n_blocks) + 2
@@ -102,7 +131,7 @@ class Config:
 
 # %% 3. Model
 
-class PreActBlock(nn.Module):
+class BaselineBlock(nn.Module):
     """
     A pre-activation ResNet building block as described in He et al 2016 sec. 4.1.
 
@@ -128,14 +157,11 @@ class PreActBlock(nn.Module):
         self.bn2 = nn.BatchNorm2d(c_out)
         self.conv2 = nn.Conv2d(c_out, c_out, 3, stride=1, padding=1, bias=False)
 
-        if downsample:
-            pad_chs = c_out - c_in
-            self.shortcut = nn.Sequential(
-                nn.MaxPool2d(kernel_size=1, stride=stride),
-                nn.ZeroPad3d((0, 0, 0, 0, 0, pad_chs)),
-            )
-        else:
-            self.shortcut = nn.Identity()
+        # 1x1 convolution shortcut in downsampling blocks.
+        self.shortcut = nn.Sequential(
+            nn.Conv2d(c_in, c_out, kernel_size=1, stride=stride, bias=False),
+            nn.BatchNorm2d(c_out),
+        ) if downsample else nn.Identity()
 
     def forward(
         self,
@@ -152,15 +178,14 @@ class PreActBlock(nn.Module):
         out = out + self.shortcut(x)
         return out
 
-class PreActResNet(nn.Module):
+class BaselineResnet(nn.Module):
     """A pre-activation ResNet as described in He et al 2016."""
 
     def __init__(self, cfg: Config) -> None:
         super().__init__()
 
-        # Input layer
+        # Input layer (only a convolution)
         self.conv1 = nn.Conv2d(3, cfg.input_conv_filters, 3, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(cfg.input_conv_filters)
 
         self.groups = nn.Sequential(*[
             self._make_group(c_in, downsample, n_blocks)
@@ -182,9 +207,9 @@ class PreActResNet(nn.Module):
         downsample: bool,
         n_blocks: int,
     ) -> nn.Sequential:
-        group = [PreActBlock(c_in, downsample)]
+        group = [BaselineBlock(c_in, downsample)]
         for _ in range(1, n_blocks):
-            group.append(PreActBlock(group[-1].c_out, False))
+            group.append(BaselineBlock(group[-1].c_out, False))
 
         return nn.Sequential(*group)
     
@@ -199,7 +224,7 @@ class PreActResNet(nn.Module):
         self,
         x: Float[Tensor, "batch channel height width"],
     ) -> Float[Tensor, "batch n_classes"]:
-        out = F.relu(self.bn1(self.conv1(x)), inplace=True)
+        out = self.conv1(x)
         out = self.groups(out)
         out = F.relu(self.bn2(out), inplace=True)
         out = self.pool(out).flatten(start_dim=1)
@@ -207,32 +232,21 @@ class PreActResNet(nn.Module):
 
 # %% 4. Dataset and Augmentation
 
-# Unusually, He et al 2015 normalizes with the per-pixel mean and without std.
-# Although it isn't explicitly stated in He et al 2016, we can assume it's the same.
-CIFAR100_MEAN_PATH = f"{DATA_DIR}/cifar_100_mean.npy"
-if not os.path.exists(CIFAR100_MEAN_PATH):
-    np_mean = CIFAR100(root=DATA_DIR, train=True, download=True).data.mean(axis=0)
-    # Convert to PyTorch-friendly format: float32 scaled to [0, 1] in (C, H, W) format.
-    np_mean = rearrange(np_mean, "h w c -> c h w")
-    np_mean = np_mean.astype(np.float32) / 255.0
-    np.save(CIFAR100_MEAN_PATH, np_mean)
-else:
-    np_mean = np.load(CIFAR100_MEAN_PATH)
-
-CIFAR100_MEAN = torch.from_numpy(np_mean)
+CIFAR100_MEAN = (0.5070757270, 0.4865502417, 0.4409192204)
+CIFAR100_STD = (0.2673342824, 0.2564384639, 0.2761504650)
 
 train_transform = v2.Compose([
     v2.ToImage(),
     v2.RandomCrop(32, padding=4),
     v2.RandomHorizontalFlip(),
     v2.ToDtype(torch.float32, scale=True),
-    v2.Lambda(lambda x: x - CIFAR100_MEAN),
+    v2.Normalize(CIFAR100_MEAN, CIFAR100_STD, inplace=True),
 ])
 
 test_transform = v2.Compose([
     v2.ToImage(),
     v2.ToDtype(torch.float32, scale=True),
-    v2.Lambda(lambda x: x - CIFAR100_MEAN),
+    v2.Normalize(CIFAR100_MEAN, CIFAR100_STD, inplace=True),
 ])
 
 # %% 5. Trainer
@@ -264,7 +278,7 @@ class PreActTrainer:
             pin_memory=True,
         )
 
-        self.model = PreActResNet(cfg).to(self.device, memory_format=torch.channels_last)
+        self.model = BaselineResnet(cfg).to(self.device, memory_format=torch.channels_last)
 
         self.opt = torch.optim.SGD(
             self.model.parameters(),
@@ -292,6 +306,15 @@ class PreActTrainer:
 
         if self.cfg.save_every > 0:
             os.makedirs("checkpoints", exist_ok=True)
+        
+        wandb.init(
+            project=self.cfg.wandb_project,
+            name=self.cfg.wandb_name,
+            config=vars(self.cfg),
+            config_exclude_keys=["wandb_project", "wandb_name", "use_wandb"],
+            save_code=True,
+        )
+        # wandb.watch(self.model, log="all", log_freq=cfg.eval_every)
 
     def train(self):
         self.model.train()
@@ -364,6 +387,8 @@ class PreActTrainer:
                 }
                 logging.info(ROW_FMT.format(*[metrics[col] for col in LOGGING_COLUMNS]))
                 pbar.set_postfix(train_loss=metrics['train_loss'], test_loss=metrics['test_loss'])
+                del metrics['step']
+                wandb.log(metrics, step=step)
                 
                 # Start the clock again.
                 torch.cuda.synchronize()
@@ -372,6 +397,7 @@ class PreActTrainer:
         torch.cuda.synchronize()
         training_time += time.perf_counter() - t0
         logging.info(f"Total training time: {training_time:,.2f}s")
+        wandb.finish()
     
     @torch.no_grad()
     def evaluate(self) -> dict[str, float]:
