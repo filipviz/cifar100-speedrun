@@ -34,9 +34,7 @@ It's based on Ben Johnson's DAWNBench submission, which:
 - Uses four groups with 2 blocks each. The first is not a downsampling group, and the rest are (meaning we apply 4x4 mean pooling at the end).
 - Uses typical mean/std normalization rather than per-pixel mean alone (as in He et al 2015).
 - Uses a somewhat odd learning rate schedule with a long linear warmup, long linear decay, and a few small jumps.
-- Uses mixed-precision training.
-
-Oddly, they apply the first batchnorm + ReLU to both the residual stream and the convolution path (which performs worse). It doesn't make a huge difference for a network this shallow, but I won't do this.
+- Uses "mixed-precision" training (it's all fp16).
 
 Page makes the following changes:
 - Removes the batchnorm + ReLU from the input stem, since they're redundant with the batchnorm + ReLU in the first residual block.
@@ -44,11 +42,13 @@ Page makes the following changes:
 - Preprocesses the dataset in advance. Rather than applying padding, normalization, and random horizontal flipping each time they load a batch, he pre-applies these. This leaves only random cropping and flipping.
 - He removes dataworkers to avoid the overhead associated with launching them. Keeping everything in the main thread saves time!
 
+Our implementation departs from theirs in a few ways:
+1. We update our learning rate each batch rather than each epoch.
+2. Oddly, they apply the first batchnorm + ReLU to both the residual stream and the convolution path (which hurts performance). It doesn't make a huge difference for a network this shallow, but I won't do this.
+3. We take a more aggressive approach to data loading by loading the entire dataset into GPU memory (in uint8) and applying pre-processing on-device during the first call to `__iter__`.
+4. We're using bfloat16 rather than fp16 (TODO - compare).
+
 TODO:
-- Replicate learning rate schedule from notebook.
-- Preprocess the dataset.
-- Mixed-precision training.
-- Remove dataloader workers (everything in main thread).
 - Combine random number calls into bulk calls up front (how did he do this?).
 
 [article](https://web.archive.org/web/20221206112356/https://myrtle.ai/how-to-train-your-resnet-1-baseline/)
@@ -57,10 +57,12 @@ TODO:
 
 # %% 1. Global Constants
 
-# assert torch.cuda.is_available(), "This script requires a CUDA-enabled GPU."
+assert torch.cuda.is_available(), "This script requires a CUDA-enabled GPU."
 
 BASE_DIR = f"{os.path.dirname(__file__)}/.."
 DATA_DIR = f"{BASE_DIR}/data"
+DEVICE = "cuda"
+DTYPE = torch.bfloat16
 
 LOGGING_COLUMNS = ['step', 'time', 'iter_time', 'lr', 'train_loss', 'train_acc1',
                    'train_acc5', 'test_loss', 'test_acc1', 'test_acc5']
@@ -84,31 +86,33 @@ class Config:
     "Number of blocks in each group."
     
     # --- Training --- #
-    train_steps: int = 64_000
+    train_steps: int = 13_999
     "Number of mini-batch iterations we train for."
     eval_every: int = 4_000
     "Set to 0 to disable evaluation."
     save_every: int = 16_000
     "Set to 0 to disable checkpointing. Must be a multiple of eval_every."
     batch_size: int = 128
-    initial_lr: float = 0.1
     momentum: float = 0.9
     "SGD momentum (not BatchNorm momentum)."
     weight_decay: float = 1e-4
-    milestones: list[int] = field(default_factory=lambda: [32_000, 48_000])
-    "MultiStepLR milestones."
-    gamma: float = 0.1
-    "MultiStepLR multiplier."
-    warmup_steps: int = 400
-    "Number of steps for the warmup learning rate."
-    warmup_lr: float = 0.01
-    "Warmup learning rate."
+    lrs: list[float] = field(default_factory=lambda: [0, 0.1, 0.005, 0])
+    "We linearly interpolate between these learning rates with np.interp(step, milestones, lrs)."
+    milestones: list[int] = field(default_factory=lambda: [0, 6_000, 12_000, 14_000])
+    "The number of steps at which we reach each learning rate."
+    
+    # --- Data Augmentation --- #
+    flip: bool = True
+    "Random horizontal flipping."
+    pad_mode: Literal['reflect', 'constant'] = 'reflect'
+    crop_padding: int = 4
+    "Set to 0 to disable padding and random cropping."
     
     # --- Setup and Flags --- #
     allow_tf32: bool = True
     cudnn_benchmark: bool = True
     cudnn_deterministic: bool = False
-    float32_matmul_precision: Literal['highest', 'high', 'medium'] = 'high'
+    float32_matmul_precision: Literal['highest', 'high', 'medium'] = 'medium'
     seed: int = 20250802
     "Set to 0 to disable seeding."
     n_workers: int = 12
@@ -133,7 +137,7 @@ class Config:
 
 class BaselineBlock(nn.Module):
     """
-    A pre-activation ResNet building block as described in He et al 2016 sec. 4.1.
+    A baseline ResNet building block as described in Page's first article.
 
     Args:
         c_in: Number of input channels.
@@ -179,7 +183,7 @@ class BaselineBlock(nn.Module):
         return out
 
 class BaselineResnet(nn.Module):
-    """A pre-activation ResNet as described in He et al 2016."""
+    """A baseline ResNet as described in Page's first article."""
 
     def __init__(self, cfg: Config) -> None:
         super().__init__()
@@ -232,76 +236,118 @@ class BaselineResnet(nn.Module):
 
 # %% 4. Dataset and Augmentation
 
-CIFAR100_MEAN = (0.5070757270, 0.4865502417, 0.4409192204)
-CIFAR100_STD = (0.2673342824, 0.2564384639, 0.2761504650)
+CIFAR100_MEAN = torch.tensor((0.5078125, 0.486328125, 0.44140625), dtype=DTYPE, device=DEVICE)
+CIFAR100_STD = torch.tensor((0.267578125, 0.255859375, 0.275390625), dtype=DTYPE, device=DEVICE)
 
-train_transform = v2.Compose([
-    v2.ToImage(),
-    v2.RandomCrop(32, padding=4),
-    v2.RandomHorizontalFlip(),
-    v2.ToDtype(torch.float32, scale=True),
-    v2.Normalize(CIFAR100_MEAN, CIFAR100_STD, inplace=True),
-])
+def batch_crop(images: Float[Tensor, "b c h_in w_in"], crop_size: int = 32) -> Float[Tensor, "b c h_out w_out"]:
+    """View-based batch cropping."""
+    b, c, h, w = images.shape
+    r = (h - crop_size) // 2
+ 
+    # Create strided views of all possible crops.
+    b_s, c_s, h_s, w_s = images.stride()
+    crops_shape = (b, c, 2*r+1, 2*r+1, crop_size, crop_size)
+    crops_stride = (b_s, c_s, h_s, w_s, h_s, w_s)
+    crops = torch.as_strided(
+        images[:, :, :h-crop_size+1, :w-crop_size+1],
+        size=crops_shape, stride=crops_stride
+    )
+    
+    # Select the appropriate crop for each image.
+    batch_idx = torch.arange(b, device=images.device)
+    shifts = torch.randint(0, 2*r+1, size=(2, b), device=images.device)
+    return crops[batch_idx, :, shifts[0], shifts[1]]
 
-test_transform = v2.Compose([
-    v2.ToImage(),
-    v2.ToDtype(torch.float32, scale=True),
-    v2.Normalize(CIFAR100_MEAN, CIFAR100_STD, inplace=True),
-])
+def batch_flip_lr(images: Float[Tensor, "b c h w"]) -> Float[Tensor, "b c h w"]:
+    """Apply random horizontal flipping to each image in the batch"""
+    flip_mask = (torch.rand(len(images), device=images.device) < 0.5).view(-1, 1, 1, 1)
+    return torch.where(flip_mask, images.flip(-1), images)
+
+class Cifar100Loader:
+    """
+    Infinite data loader for CIFAR-100. Loads entire dataset into GPU memory, performs transformations on GPU, and doesn't require re-initialization each epoch.
+    """
+    def __init__(self, cfg: Config, train: bool = True, device: str = DEVICE):
+        self.cfg = cfg
+        self.device, self.train = device, train
+        self.batch_size = cfg.batch_size
+
+        # Load or download data
+        cifar_path = os.path.join(DATA_DIR, 'train.pt' if train else 'test.pt')
+        if not os.path.exists(cifar_path):
+            np_cifar = CIFAR100(root=DATA_DIR, train=train, download=True)
+            images = torch.tensor(np_cifar.data)
+            labels = torch.tensor(np_cifar.targets)
+            torch.save({'images': images, 'labels': labels, 'classes': np_cifar.classes}, cifar_path)
+
+        # Transfer as uint8 then convert on GPU. This is faster than loading pre-processed bf16 data.
+        data = torch.load(cifar_path, map_location=device)
+        self.images, self.labels, self.classes = data['images'], data['labels'], data['classes']
+        
+        # Convert to bf16, normalize, and rearrange on GPU
+        self.images = self.images.to(DTYPE) / 255.0
+        self.images = (self.images - CIFAR100_MEAN) / CIFAR100_STD
+        self.images = rearrange(self.images, "b h w c -> b c h w").to(memory_format=torch.channels_last)
+        
+        self.n_images = len(self.images)
+        
+    def __iter__(self):
+        indices = torch.randperm(self.n_images, device=self.device)
+        pos = 0
+        
+        while True:
+            # If we need to wrap around, we combine remaining indices with indices from the new epoch.
+            if pos + self.batch_size > self.n_images:
+                remaining = indices[pos:]
+                indices = torch.randperm(self.n_images, device=self.device)
+                needed = self.batch_size - len(remaining)
+                batch_indices = torch.cat([remaining, indices[:needed]])
+                pos = needed
+            else:
+                # Otherwise, we take the next batch of indices from the current epoch.
+                batch_indices = indices[pos:pos + self.batch_size]
+                pos += self.batch_size
+            
+            images = self.images[batch_indices]
+            labels = self.labels[batch_indices]
+            
+            if self.train:
+                if self.cfg.crop_padding > 0:
+                    images = F.pad(images, (self.cfg.crop_padding,) * 4, mode=self.cfg.pad_mode)
+                    images = batch_crop(images, crop_size=32)
+                if self.cfg.flip:
+                    images = batch_flip_lr(images)
+            
+            yield images, labels
+
 
 # %% 5. Trainer
 
-class PreActTrainer:
+class BaselineTrainer:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.device = torch.device("cuda")
         
-        generator = torch.Generator().manual_seed(cfg.seed) if cfg.seed > 0 else None
+        self.train_loader = Cifar100Loader(cfg, train=True, device=self.device)
+        self.test_loader = Cifar100Loader(cfg, train=False, device=self.device)
 
-        self.train_loader = DataLoader(
-            CIFAR100(root=DATA_DIR, train=True, transform=train_transform, download=True),
-            batch_size=cfg.batch_size,
-            shuffle=True,
-            num_workers=cfg.n_workers,
-            persistent_workers=cfg.n_workers > 0,
-            drop_last=True,
-            pin_memory=True,
-            generator=generator,
+        self.model = BaselineResnet(cfg).to(
+            device=self.device,
+            dtype=DTYPE, 
+            memory_format=torch.channels_last
         )
-        self.test_loader = DataLoader(
-            CIFAR100(root=DATA_DIR, train=False, transform=test_transform, download=True),
-            batch_size=cfg.batch_size,
-            shuffle=False,
-            num_workers=cfg.n_workers,
-            persistent_workers=cfg.n_workers > 0, # Can disable if hitting memory limits.
-            drop_last=False,
-            pin_memory=True,
-        )
-
-        self.model = BaselineResnet(cfg).to(self.device, memory_format=torch.channels_last)
 
         self.opt = torch.optim.SGD(
             self.model.parameters(),
-            lr=cfg.initial_lr,
+            lr=1.0, # LambdaLR sets lr=initial_lr * lambda(step)
             momentum=cfg.momentum,
             weight_decay=cfg.weight_decay,
             fused=True,
         )
         
-        warmup = torch.optim.lr_scheduler.ConstantLR(
+        self.scheduler = torch.optim.lr_scheduler.LambdaLR(
             self.opt,
-            factor=cfg.warmup_lr / cfg.initial_lr,
-            total_iters=cfg.warmup_steps,
-        )
-        multistep = torch.optim.lr_scheduler.MultiStepLR(
-            self.opt,
-            milestones=[m - cfg.warmup_steps for m in cfg.milestones],
-            gamma=cfg.gamma,
-        )
-        self.scheduler = torch.optim.lr_scheduler.SequentialLR(
-            self.opt,
-            schedulers=[warmup, multistep],
-            milestones=[cfg.warmup_steps],
+            lambda step: np.interp(step, cfg.milestones, cfg.lrs).item(),
         )
 
         if self.cfg.save_every > 0:
@@ -331,27 +377,24 @@ class PreActTrainer:
             # ---- Training ---- #
             
             # 1. Load our batch and labels.
-            try:
-                batch, labels = next(loader_iter)
-            except StopIteration:
-                loader_iter = iter(self.train_loader)
-                batch, labels = next(loader_iter)
-                
-            batch = batch.to(self.device, non_blocking=True, memory_format=torch.channels_last)
+            batch, labels = next(loader_iter)
+            assert batch.is_contiguous(memory_format=torch.channels_last)
+            batch = batch.to(self.device, non_blocking=True)
             labels = labels.to(self.device, non_blocking=True)
 
             # 2. Forward pass.
             pred = self.model(batch)
             loss = F.cross_entropy(pred, labels)
 
-            # 3. Backward pass.
+            # 3. Update our learning rate.
+            # We do this before the optimizer step to avoid a first step with lr=0.0
+            self.scheduler.step(step)
+
+            # 4. Backward pass.
             self.opt.zero_grad(set_to_none=True)
             loss.backward()
             self.opt.step()
 
-            # 4. Update our learning rate.
-            self.scheduler.step()
-            
             # ---- Evaluation ---- #
             last_step = step == self.cfg.train_steps
             if last_step or self.cfg.eval_every > 0 and step % self.cfg.eval_every == 0:
@@ -451,7 +494,7 @@ if __name__ == "__main__":
     logging.info(tabulate(vars(cfg).items(), headers=["Config Field", "Value"]))
     
     # Train our model
-    trainer = PreActTrainer(cfg)
+    trainer = BaselineTrainer(cfg)
     logging.info(HEADER_FMT.format(*LOGGING_COLUMNS))
     logging.info(HEADER_FMT.format(*['---' for _ in LOGGING_COLUMNS]))
     trainer.train()
