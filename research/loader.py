@@ -1,16 +1,26 @@
 # Prototyping and experimenting with our data loader.
 # %%
+import contextlib
+from datetime import datetime
+import gc
+import logging
 import os
+import sys
+import time
 from typing import Literal
+from tabulate import tabulate
 import torch
 from torch import Tensor
 from jaxtyping import Float
 from torch.utils.data import DataLoader
 from torchvision.datasets import CIFAR100
 from torchvision.transforms import v2
+from torchvision.models import resnet18
 from einops import rearrange
 from dataclasses import dataclass
 import torch.nn.functional as F
+from tqdm import trange
+# %%
 
 assert torch.cuda.is_available(), "This script requires a CUDA-enabled GPU."
 
@@ -22,6 +32,8 @@ DEVICE = 'cuda'
 DTYPE = torch.float16
 CIFAR100_MEAN = torch.tensor((0.5078125, 0.486328125, 0.44140625), dtype=DTYPE, device=DEVICE)
 CIFAR100_STD = torch.tensor((0.267578125, 0.255859375, 0.275390625), dtype=DTYPE, device=DEVICE)
+CPU_MEAN, CPU_STD = CIFAR100_MEAN.cpu(), CIFAR100_STD.cpu()
+TOTAL_ITERS = 3_000
 
 # %%
 
@@ -100,11 +112,11 @@ class Cifar100Loader:
             labels = torch.tensor(np_cifar.targets)
             torch.save({'images': images, 'labels': labels, 'classes': np_cifar.classes}, cifar_path)
 
-        # Transfer as uint8 then convert on GPU. This is faster than loading pre-processed bf16 data.
+        # Transfer as uint8 then convert on GPU. This is faster than loading pre-processed fp16 data.
         data = torch.load(cifar_path, map_location=device)
         self.images, self.labels, self.classes = data['images'], data['labels'], data['classes']
         
-        # Convert to bf16, normalize, and rearrange on GPU
+        # Convert to fp16, normalize, and rearrange on GPU
         self.images = self.images.to(DTYPE) / 255.0
         self.images = (self.images - CIFAR100_MEAN) / CIFAR100_STD
         if self.train and cfg.crop_padding > 0:
@@ -153,75 +165,152 @@ class Cifar100Loader:
 
 train_transform = v2.Compose([
     v2.ToImage(),
-    v2.RandomCrop(32, padding=4),
+    v2.RandomCrop(32, padding=4, padding_mode="reflect"),
     v2.RandomHorizontalFlip(),
     v2.ToDtype(DTYPE, scale=True),
-    v2.Normalize(CIFAR100_MEAN, CIFAR100_STD),
+    v2.Normalize(CPU_MEAN, CPU_STD),
 ])
 
+"""
 test_transform = v2.Compose([
     v2.ToImage(),
     v2.ToDtype(DTYPE, scale=True),
-    v2.Normalize(CIFAR100_MEAN, CIFAR100_STD),
+    v2.Normalize(CPU_MEAN, CPU_STD),
 ])
+"""
 
 # %%
 
-
 if __name__ == "__main__":
-    from torch.profiler import profile, record_function
-
-    cfg = Config()
-
-    with profile(with_stack=True, profile_memory=True) as prof:
-        with record_function("init_torch_train_loader"):
-            torch_train_loader = DataLoader(
-                CIFAR100(root=DATA_DIR, train=True, download=True, transform=test_transform),
-                batch_size=cfg.batch_size,
-                shuffle=True,
-                num_workers=12,
-                pin_memory=True,
-                drop_last=True,
-                persistent_workers=True,
-            )
-        with record_function("init_torch_test_loader"):
-            torch_test_loader = DataLoader(
-                CIFAR100(root=DATA_DIR, train=False, download=True, transform=test_transform),
-                batch_size=cfg.batch_size,
-                shuffle=False,
-                num_workers=12,
-                pin_memory=True,
-                drop_last=False,
-                persistent_workers=True,
-            )
-        with record_function("init_cifar_train_loader"):
-            cifar_train_loader = Cifar100Loader(cfg, train=True, device=DEVICE)
-        with record_function("init_cifar_test_loader"):
-            cifar_test_loader = Cifar100Loader(cfg, train=False, device=DEVICE)
+    if not os.path.exists(f"{BASE_DIR}/logs"):
+        os.makedirs(f"{BASE_DIR}/logs", exist_ok=True)
         
-        with record_function("torch_train_iter"):
-            torch_train_iter = iter(torch_train_loader)
-        with record_function("torch_test_iter"):
-            torch_test_iter = iter(torch_test_loader)
-        with record_function("cifar_train_iter"):
-            cifar_train_iter = iter(cifar_train_loader)
-        with record_function("cifar_test_iter"):
-            cifar_test_iter = iter(cifar_test_loader)
-        
-        with record_function("torch_train_next"):
-            for _ in range(10):
-                img, label = next(torch_train_iter)
-                img, label = img.to(DEVICE), label.to(DEVICE)
-        with record_function("torch_test_next"):
-            for _ in range(10):
-                img, label = next(torch_test_iter)
-                img, label = img.to(DEVICE), label.to(DEVICE)
-        with record_function("cifar_train_next"):
-            for _ in range(10):
-                img, label = next(cifar_train_iter)
-        with record_function("cifar_test_next"):
-            for _ in range(10):
-                img, label = next(cifar_test_iter)
+    log_id = datetime.now().isoformat(timespec="seconds")
+    logging.basicConfig(
+        format="%(message)s",
+        level=logging.INFO,
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler(f"{BASE_DIR}/logs/{log_id}-loader.txt"),
+        ],
+    )
 
-    prof.export_chrome_trace("loaders.json")
-    print(prof.key_averages().table(sort_by="cuda_time_total"))
+    logging.info(" ".join(sys.argv))
+    logging.info(f"{log_id=}")
+    logging.info(f"Running Python {sys.version} and PyTorch {torch.version.__version__}")
+    logging.info(f"Running CUDA {torch.version.cuda} and cuDNN {torch.backends.cudnn.version()}")
+    logging.info(torch.cuda.get_device_name())
+    logging.info(tabulate(vars(Config()).items(), headers=["Config Field", "Value"]))
+
+    def model_and_opt():
+        model = resnet18(num_classes=100).to(
+            device=DEVICE,
+            dtype=DTYPE,
+            memory_format=torch.channels_last,
+            non_blocking=True,
+        )
+        opt = torch.optim.SGD(
+            model.parameters(),
+            lr=1e-3,
+            momentum=0.9,
+            weight_decay=1e-4,
+            nesterov=True,
+            fused=True,
+        )
+        return model, opt
+    
+    def cleanup():
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+    
+    def log_times(title, t0, t1, t2, t3):
+        strs = [
+            f"=== {title} ===",
+            f"Time to initialize: {t1 - t0:,.3f}s",
+            f"Time for iter(): {t2 - t1:,.3f}s",
+            f"Total training time: {t3 - t2:,.3f}s",
+            f"Average time per step: {(t3 - t2) / TOTAL_ITERS:,.3f}s",
+            f"Total time: {t3 - t0:,.3f}s",
+            f"Max memory allocated: {torch.cuda.max_memory_allocated() // 1024**2:,} MiB",
+            f"Max memory reserved: {torch.cuda.max_memory_reserved() // 1024**2:,} MiB",
+        ]
+        logging.info("\n".join(strs))
+
+    
+    for batch_size in [128, 512, 768, 2048]:
+
+        with contextlib.suppress(NameError):
+            del model, opt, cifar_train_loader, cifar_train_iter, batch, labels, out, loss
+        cleanup()
+
+        model, opt = model_and_opt()
+        
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        torch_train_loader = DataLoader(
+            CIFAR100(root=DATA_DIR, train=True, download=True, transform=train_transform),
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=12,
+            pin_memory=True,
+            drop_last=True,
+            persistent_workers=True,
+        )
+
+        torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        torch_train_iter = iter(torch_train_loader)
+
+        torch.cuda.synchronize()
+        t2 = time.perf_counter()
+        for _ in trange(TOTAL_ITERS, desc="Torch train"):
+            try:
+                batch, labels = next(torch_train_iter)
+            except StopIteration:
+                torch_train_iter = iter(torch_train_loader)
+                batch, labels = next(torch_train_iter)
+                
+            batch = batch.to(device=DEVICE, memory_format=torch.channels_last, non_blocking=True)
+            labels = labels.to(device=DEVICE, non_blocking=True)
+
+            out = model(batch)
+            loss = F.cross_entropy(out, labels)
+            loss.backward()
+            opt.step()
+            opt.zero_grad(set_to_none=True)
+            
+        torch.cuda.synchronize()
+        t3 = time.perf_counter()
+        assert batch.is_contiguous(memory_format=torch.channels_last)
+        log_times(f"Torch loader (bs={batch_size}, iters={TOTAL_ITERS})", t0, t1, t2, t3)
+        
+        del model, opt, torch_train_loader, torch_train_iter, batch, labels, out, loss
+        cleanup()
+
+        model, opt = model_and_opt()
+        cfg = Config(batch_size=batch_size)
+        
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        cifar_train_loader = Cifar100Loader(cfg, train=True, device=DEVICE)
+
+        torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        cifar_train_iter = iter(cifar_train_loader)
+
+        torch.cuda.synchronize()
+        t2 = time.perf_counter()
+        for _ in trange(TOTAL_ITERS, desc="Cifar train"):
+            batch, labels = next(cifar_train_iter)
+            out = model(batch)
+            loss = F.cross_entropy(out, labels)
+            loss.backward()
+            opt.step()
+            opt.zero_grad(set_to_none=True)
+
+        torch.cuda.synchronize()
+        t3 = time.perf_counter()
+        assert batch.is_contiguous(memory_format=torch.channels_last)
+        log_times(f"Cifar loader (bs={batch_size}, iters={TOTAL_ITERS})", t0, t1, t2, t3)

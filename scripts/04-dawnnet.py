@@ -44,7 +44,7 @@ Page makes the following changes:
 - Preprocesses the dataset in advance. Rather than applying padding, normalization, and random horizontal flipping each time they load a batch, he pre-applies these. This leaves only random cropping and flipping.
 - He removes dataworkers to avoid the overhead associated with launching them. Keeping everything in the main thread saves time!
 - He scales the weight decay by the batch size and divides the learning rate by the batch size.
-- He uses SGD with Nesterov momentum.
+- He uses SGD with (PyTorch-style) Nesterov momentum.
 
 Our implementation departs from theirs in a few ways:
 1. We use step-based (rather than epoch-based) scheduling.
@@ -286,11 +286,11 @@ class Cifar100Loader:
             labels = torch.tensor(np_cifar.targets)
             torch.save({'images': images, 'labels': labels, 'classes': np_cifar.classes}, cifar_path)
 
-        # Transfer as uint8 then convert on GPU. This is faster than loading pre-processed bf16 data.
+        # Transfer as uint8 then convert on GPU. This is faster than loading pre-processed data in fp16/bf16/fp32.
         data = torch.load(cifar_path, map_location=device)
         self.images, self.labels, self.classes = data['images'], data['labels'], data['classes']
         
-        # Convert to bf16, normalize, and rearrange on GPU
+        # Convert to dtype, normalize, and rearrange on GPU
         self.images = self.images.to(DTYPE) / 255.0
         self.images = (self.images - CIFAR100_MEAN) / CIFAR100_STD
         if self.train and cfg.crop_padding > 0:
