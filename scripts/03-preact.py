@@ -41,7 +41,7 @@ assert torch.cuda.is_available(), "This script requires a CUDA-enabled GPU."
 BASE_DIR = f"{os.path.dirname(__file__)}/.."
 DATA_DIR = f"{BASE_DIR}/data"
 
-LOGGING_COLUMNS = ['step', 'time', 'iter_time', 'lr', 'train_loss', 'train_acc1',
+LOGGING_COLUMNS = ['step', 'time', 'interval_time', 'lr', 'train_loss', 'train_acc1',
                    'train_acc5', 'test_loss', 'test_acc1', 'test_acc5']
 HEADER_FMT = "|{:^6s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|"
 ROW_FMT = "|{:>6d}|{:>10,.3f}|{:>10,.3f}|{:>10,.3e}|{:>10,.3f}|{:>10.3%}|{:>10.3%}|{:>10,.3f}|{:>10.3%}|{:>10.3%}|"
@@ -333,8 +333,8 @@ class PreActTrainer:
             last_step = step == self.cfg.train_steps
             if last_step or self.cfg.eval_every > 0 and step % self.cfg.eval_every == 0:
                 torch.cuda.synchronize()
-                iter_time = time.perf_counter() - t0
-                training_time += iter_time
+                interval_time = time.perf_counter() - t0
+                training_time += interval_time
                 
                 # Save a checkpoint.
                 if self.cfg.save_every > 0 and (
@@ -355,7 +355,7 @@ class PreActTrainer:
                 metrics = {
                     "step": step, 
                     "time": training_time,
-                    "iter_time": iter_time,
+                    "interval_time": interval_time,
                     "lr": self.scheduler.get_last_lr()[0],
                     "train_loss": loss.item(),
                     "train_acc1": (pred.argmax(dim=1) == labels).float().mean().item(),

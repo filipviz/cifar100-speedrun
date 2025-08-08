@@ -23,30 +23,33 @@ import wandb
 
 # %% [markdown]
 """
-In this script, we implement the baseline ResNet described in [*How to Train Your ResNet 1: Baseline*](https://web.archive.org/web/20221206112356/https://myrtle.ai/how-to-train-your-resnet-1-baseline/).
+In this script, we implement the DAWNNet ResNet with the changes described in [*How to Train Your ResNet 1: Baseline*](https://web.archive.org/web/20221206112356/https://myrtle.ai/how-to-train-your-resnet-1-baseline/).
 
 Since we're starting to make more opinionated and idiosyncratic changes, we'll add wandb logging to more easily compare results across runs.
 
 It's based on Ben Johnson's DAWNBench submission, which:
 - Is an 18-layer pre-activation ResNet.
-- Uses 64 -> 128 -> 256 -> 512 channels. Much shallower and wider than the original ResNet.
+- Uses 64 -> 128 -> 256 -> 256 channels. Much shallower and wider than the original ResNet.
 - Uses 1x1 convolutions for downsampling shortcuts.
 - Uses four groups with 2 blocks each. The first is not a downsampling group, and the rest are (meaning we apply 4x4 mean pooling at the end).
 - Uses typical mean/std normalization rather than per-pixel mean alone (as in He et al 2015).
 - Uses a somewhat odd learning rate schedule with a long linear warmup, long linear decay, and a few small jumps.
-- Uses "mixed-precision" training (it's all fp16).
+- Uses half-precision (fp16) training.
+- Pads with mode='reflect'.
+- Rather than simply average-pooling before the final linear layer, they apply both average-pooling and max-pooling, concatenate the results, and feed the result to the linear layer.
 
 Page makes the following changes:
 - Removes the batchnorm + ReLU from the input stem, since they're redundant with the batchnorm + ReLU in the first residual block.
 - Removes some of the jumps in the learning rate schedule.
 - Preprocesses the dataset in advance. Rather than applying padding, normalization, and random horizontal flipping each time they load a batch, he pre-applies these. This leaves only random cropping and flipping.
 - He removes dataworkers to avoid the overhead associated with launching them. Keeping everything in the main thread saves time!
+- He scales the weight decay by the batch size and divides the learning rate by the batch size.
+- He uses SGD with Nesterov momentum.
 
 Our implementation departs from theirs in a few ways:
-1. We update our learning rate each batch rather than each epoch.
+1. We use step-based (rather than epoch-based) scheduling.
 2. Oddly, they apply the first batchnorm + ReLU to both the residual stream and the convolution path (which hurts performance). It doesn't make a huge difference for a network this shallow, but I won't do this.
 3. We take a more aggressive approach to data loading by loading the entire dataset into GPU memory (in uint8) and applying pre-processing on-device during the first call to `__iter__`.
-4. We're using bfloat16 rather than fp16 (TODO - compare).
 
 TODO:
 - Combine random number calls into bulk calls up front (how did he do this?).
@@ -62,9 +65,9 @@ assert torch.cuda.is_available(), "This script requires a CUDA-enabled GPU."
 BASE_DIR = f"{os.path.dirname(__file__)}/.."
 DATA_DIR = f"{BASE_DIR}/data"
 DEVICE = "cuda"
-DTYPE = torch.bfloat16
+DTYPE = torch.float16
 
-LOGGING_COLUMNS = ['step', 'time', 'iter_time', 'lr', 'train_loss', 'train_acc1',
+LOGGING_COLUMNS = ['step', 'time', 'interval_time', 'lr', 'train_loss', 'train_acc1',
                    'train_acc5', 'test_loss', 'test_acc1', 'test_acc5']
 HEADER_FMT = "|{:^6s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|"
 ROW_FMT = "|{:>6d}|{:>10,.3f}|{:>10,.3f}|{:>10,.3e}|{:>10,.3f}|{:>10.3%}|{:>10.3%}|{:>10,.3f}|{:>10.3%}|{:>10.3%}|"
@@ -80,26 +83,26 @@ class Config:
     "c_out for the convolution applied to the input."
     group_c_ins: list[int] = field(default_factory=lambda: [64, 64, 128, 256])
     "c_in for the first convolution in each group."
-    group_downsample: list[bool] = field(default_factory=lambda: [False, True, True, True])
+    group_downsample: list[bool] = field(default_factory=lambda: [False, True, True, False])
     "Whether the first block in each group downsamples the feature map size and doubles the number of channels."
     group_n_blocks: list[int] = field(default_factory=lambda: [2, 2, 2, 2])
     "Number of blocks in each group."
     
     # --- Training --- #
-    train_steps: int = 13_999
+    train_steps: int = 14_000
     "Number of mini-batch iterations we train for."
-    eval_every: int = 4_000
+    eval_every: int = 2_000
     "Set to 0 to disable evaluation."
-    save_every: int = 16_000
+    save_every: int = 14_000
     "Set to 0 to disable checkpointing. Must be a multiple of eval_every."
     batch_size: int = 128
     momentum: float = 0.9
     "SGD momentum (not BatchNorm momentum)."
-    weight_decay: float = 1e-4
+    weight_decay: float = 5e-4 * batch_size
     lrs: list[float] = field(default_factory=lambda: [0, 0.1, 0.005, 0])
     "We linearly interpolate between these learning rates with np.interp(step, milestones, lrs)."
-    milestones: list[int] = field(default_factory=lambda: [0, 6_000, 12_000, 14_000])
-    "The number of steps at which we reach each learning rate."
+    milestones: list[int] = field(default_factory=lambda: [0, 6_000, 12_000, 14_001])
+    "The number of steps at which we reach each learning rate. Last step is train_steps + 1 to avoid a final step with lr=0.0."
     
     # --- Data Augmentation --- #
     flip: bool = True
@@ -135,9 +138,9 @@ class Config:
 
 # %% 3. Model
 
-class BaselineBlock(nn.Module):
+class DAWNBlock(nn.Module):
     """
-    A baseline ResNet building block as described in Page's first article.
+    A DAWNNet ResNet building block. Does not apply batchnorm and ReLU to the residual stream.
 
     Args:
         c_in: Number of input channels.
@@ -151,7 +154,6 @@ class BaselineBlock(nn.Module):
         downsample: bool,
     ) -> None:
         super().__init__()
-        
         self.c_out = c_out = 2 * c_in if downsample else c_in
         stride = 2 if downsample else 1
 
@@ -162,10 +164,8 @@ class BaselineBlock(nn.Module):
         self.conv2 = nn.Conv2d(c_out, c_out, 3, stride=1, padding=1, bias=False)
 
         # 1x1 convolution shortcut in downsampling blocks.
-        self.shortcut = nn.Sequential(
-            nn.Conv2d(c_in, c_out, kernel_size=1, stride=stride, bias=False),
-            nn.BatchNorm2d(c_out),
-        ) if downsample else nn.Identity()
+        if downsample:
+            self.shortcut = nn.Conv2d(c_in, c_out, kernel_size=1, stride=stride, bias=False)
 
     def forward(
         self,
@@ -176,14 +176,17 @@ class BaselineBlock(nn.Module):
         half of h_in/w_in respectively. Otherwise, they all match.
         """
         out = F.relu(self.bn1(x), inplace=True)
+        # He et al 2016, appendix: "when preactivation is used, these projection shortcuts are also with pre-activation."
+        residual = self.shortcut(out) if hasattr(self, 'shortcut') else x
         out = self.conv1(out)
         out = F.relu(self.bn2(out), inplace=True)
         out = self.conv2(out)
-        out = out + self.shortcut(x)
-        return out
+        return out + residual
 
-class BaselineResnet(nn.Module):
-    """A baseline ResNet as described in Page's first article."""
+class DAWNNet(nn.Module):
+    """
+    A DAWNNet ResNet. Similar to a pre-activation ResNet, but shallower and wider. Uses concatenated average and max pooling before the final linear layer.
+    """
 
     def __init__(self, cfg: Config) -> None:
         super().__init__()
@@ -200,8 +203,9 @@ class BaselineResnet(nn.Module):
         # Output layer
         c_out = self.groups[-1][-1].c_out
         self.bn2 = nn.BatchNorm2d(c_out)
-        self.pool = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Linear(c_out, cfg.n_classes)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Linear(2*c_out, cfg.n_classes)
         
         self.apply(self._init_weights)
     
@@ -211,10 +215,9 @@ class BaselineResnet(nn.Module):
         downsample: bool,
         n_blocks: int,
     ) -> nn.Sequential:
-        group = [BaselineBlock(c_in, downsample)]
+        group = [DAWNBlock(c_in, downsample)]
         for _ in range(1, n_blocks):
-            group.append(BaselineBlock(group[-1].c_out, False))
-
+            group.append(DAWNBlock(group[-1].c_out, False))
         return nn.Sequential(*group)
     
     @staticmethod
@@ -231,13 +234,16 @@ class BaselineResnet(nn.Module):
         out = self.conv1(x)
         out = self.groups(out)
         out = F.relu(self.bn2(out), inplace=True)
-        out = self.pool(out).flatten(start_dim=1)
+        out = torch.cat([
+            self.avg_pool(out).flatten(start_dim=1),
+            self.max_pool(out).flatten(start_dim=1),
+        ], dim=1)
         return self.fc(out)
 
 # %% 4. Dataset and Augmentation
 
-CIFAR100_MEAN = torch.tensor((0.5078125, 0.486328125, 0.44140625), dtype=DTYPE, device=DEVICE)
-CIFAR100_STD = torch.tensor((0.267578125, 0.255859375, 0.275390625), dtype=DTYPE, device=DEVICE)
+CIFAR100_MEAN = torch.tensor((0.5068359375, 0.486572265625, 0.44091796875), dtype=DTYPE, device=DEVICE)
+CIFAR100_STD = torch.tensor((0.267333984375, 0.25634765625, 0.276123046875), dtype=DTYPE, device=DEVICE)
 
 def batch_crop(images: Float[Tensor, "b c h_in w_in"], crop_size: int = 32) -> Float[Tensor, "b c h_out w_out"]:
     """View-based batch cropping."""
@@ -287,43 +293,51 @@ class Cifar100Loader:
         # Convert to bf16, normalize, and rearrange on GPU
         self.images = self.images.to(DTYPE) / 255.0
         self.images = (self.images - CIFAR100_MEAN) / CIFAR100_STD
+        if self.train and cfg.crop_padding > 0:
+            self.images = F.pad(self.images, (0, 0) + (cfg.crop_padding,) * 4, mode=cfg.pad_mode)
         self.images = rearrange(self.images, "b h w c -> b c h w").to(memory_format=torch.channels_last)
         
         self.n_images = len(self.images)
-        
+    
+    def __len__(self):
+        # math.ceil(self.n_images / self.batch_size)
+        return (self.n_images + self.batch_size - 1) // self.batch_size
+    
     def __iter__(self):
         indices = torch.randperm(self.n_images, device=self.device)
-        pos = 0
-        
-        while True:
+        position = 0
+        loop = True
+
+        while loop:
+            last_batch = position + self.batch_size > self.n_images
             # If we need to wrap around, we combine remaining indices with indices from the new epoch.
-            if pos + self.batch_size > self.n_images:
-                remaining = indices[pos:]
+            if last_batch and self.train:
+                remaining = indices[position:]
                 indices = torch.randperm(self.n_images, device=self.device)
                 needed = self.batch_size - len(remaining)
                 batch_indices = torch.cat([remaining, indices[:needed]])
-                pos = needed
+                position = needed
             else:
                 # Otherwise, we take the next batch of indices from the current epoch.
-                batch_indices = indices[pos:pos + self.batch_size]
-                pos += self.batch_size
+                batch_indices = indices[position:position + self.batch_size]
+                position += self.batch_size
+                if last_batch and not self.train:
+                    loop = False
             
             images = self.images[batch_indices]
             labels = self.labels[batch_indices]
             
             if self.train:
                 if self.cfg.crop_padding > 0:
-                    images = F.pad(images, (self.cfg.crop_padding,) * 4, mode=self.cfg.pad_mode)
                     images = batch_crop(images, crop_size=32)
                 if self.cfg.flip:
                     images = batch_flip_lr(images)
-            
-            yield images, labels
 
+            yield images, labels
 
 # %% 5. Trainer
 
-class BaselineTrainer:
+class DAWNTrainer:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.device = torch.device("cuda")
@@ -331,7 +345,7 @@ class BaselineTrainer:
         self.train_loader = Cifar100Loader(cfg, train=True, device=self.device)
         self.test_loader = Cifar100Loader(cfg, train=False, device=self.device)
 
-        self.model = BaselineResnet(cfg).to(
+        self.model = DAWNNet(cfg).to(
             device=self.device,
             dtype=DTYPE, 
             memory_format=torch.channels_last
@@ -339,28 +353,28 @@ class BaselineTrainer:
 
         self.opt = torch.optim.SGD(
             self.model.parameters(),
-            lr=1.0, # LambdaLR sets lr=initial_lr * lambda(step)
+            lr=0.0,
             momentum=cfg.momentum,
             weight_decay=cfg.weight_decay,
+            nesterov=True,
             fused=True,
         )
         
-        self.scheduler = torch.optim.lr_scheduler.LambdaLR(
-            self.opt,
-            lambda step: np.interp(step, cfg.milestones, cfg.lrs).item(),
-        )
-
         if self.cfg.save_every > 0:
             os.makedirs("checkpoints", exist_ok=True)
         
-        wandb.init(
-            project=self.cfg.wandb_project,
-            name=self.cfg.wandb_name,
-            config=vars(self.cfg),
-            config_exclude_keys=["wandb_project", "wandb_name", "use_wandb"],
-            save_code=True,
-        )
+        if self.cfg.use_wandb:
+            wandb.init(
+                project=self.cfg.wandb_project,
+                name=self.cfg.wandb_name,
+                config=vars(self.cfg),
+                config_exclude_keys=["wandb_project", "wandb_name", "use_wandb"],
+                save_code=True,
+            )
         # wandb.watch(self.model, log="all", log_freq=cfg.eval_every)
+    
+    def get_lr(self, step: int) -> float:
+        return np.interp(step, self.cfg.milestones, self.cfg.lrs).item() / self.cfg.batch_size
 
     def train(self):
         self.model.train()
@@ -378,9 +392,6 @@ class BaselineTrainer:
             
             # 1. Load our batch and labels.
             batch, labels = next(loader_iter)
-            assert batch.is_contiguous(memory_format=torch.channels_last)
-            batch = batch.to(self.device, non_blocking=True)
-            labels = labels.to(self.device, non_blocking=True)
 
             # 2. Forward pass.
             pred = self.model(batch)
@@ -388,7 +399,7 @@ class BaselineTrainer:
 
             # 3. Update our learning rate.
             # We do this before the optimizer step to avoid a first step with lr=0.0
-            self.scheduler.step(step)
+            self.opt.param_groups[0]['lr'] = self.get_lr(step)
 
             # 4. Backward pass.
             self.opt.zero_grad(set_to_none=True)
@@ -399,8 +410,8 @@ class BaselineTrainer:
             last_step = step == self.cfg.train_steps
             if last_step or self.cfg.eval_every > 0 and step % self.cfg.eval_every == 0:
                 torch.cuda.synchronize()
-                iter_time = time.perf_counter() - t0
-                training_time += iter_time
+                interval_time = time.perf_counter() - t0
+                training_time += interval_time
                 
                 # Save a checkpoint.
                 if self.cfg.save_every > 0 and (
@@ -409,7 +420,6 @@ class BaselineTrainer:
                     torch.save({
                         'model': self.model.state_dict(),
                         'optimizer': self.opt.state_dict(),
-                        'scheduler': self.scheduler.state_dict(),
                         'step': step,
                     }, f"checkpoints/run-{self.cfg.run_id}-step-{step}.pt")
                 
@@ -421,8 +431,8 @@ class BaselineTrainer:
                 metrics = {
                     "step": step, 
                     "time": training_time,
-                    "iter_time": iter_time,
-                    "lr": self.scheduler.get_last_lr()[0],
+                    "interval_time": interval_time,
+                    "lr": self.opt.param_groups[0]['lr'],
                     "train_loss": loss.item(),
                     "train_acc1": (pred.argmax(dim=1) == labels).float().mean().item(),
                     "train_acc5": (pred.topk(5)[1] == labels.view(-1, 1)).any(dim=1).float().mean().item(),
@@ -430,8 +440,9 @@ class BaselineTrainer:
                 }
                 logging.info(ROW_FMT.format(*[metrics[col] for col in LOGGING_COLUMNS]))
                 pbar.set_postfix(train_loss=metrics['train_loss'], test_loss=metrics['test_loss'])
-                del metrics['step']
-                wandb.log(metrics, step=step)
+                if self.cfg.use_wandb:
+                    del metrics['step']
+                    wandb.log(metrics, step=step)
                 
                 # Start the clock again.
                 torch.cuda.synchronize()
@@ -445,15 +456,13 @@ class BaselineTrainer:
     @torch.no_grad()
     def evaluate(self) -> dict[str, float]:
         assert not self.model.training, "Model must be in eval mode"
-        items = len(self.test_loader.dataset)
+        items = self.test_loader.n_images
         cum_loss = torch.tensor(0.0, device="cuda")
         n_correct_top1 = torch.tensor(0.0, device="cuda")
         n_correct_top5 = torch.tensor(0.0, device="cuda")
 
         pbar = tqdm(self.test_loader, desc="Evaluating", position=1, leave=False)
         for batch, labels in pbar:
-            batch = batch.to(self.device, non_blocking=True, memory_format=torch.channels_last)
-            labels = labels.to(self.device, non_blocking=True)
             pred = self.model(batch)
             loss = F.cross_entropy(pred, labels, reduction="sum")
 
@@ -494,7 +503,7 @@ if __name__ == "__main__":
     logging.info(tabulate(vars(cfg).items(), headers=["Config Field", "Value"]))
     
     # Train our model
-    trainer = BaselineTrainer(cfg)
+    trainer = DAWNTrainer(cfg)
     logging.info(HEADER_FMT.format(*LOGGING_COLUMNS))
     logging.info(HEADER_FMT.format(*['---' for _ in LOGGING_COLUMNS]))
     trainer.train()
