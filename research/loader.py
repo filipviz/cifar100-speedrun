@@ -314,3 +314,15 @@ if __name__ == "__main__":
         t3 = time.perf_counter()
         assert batch.is_contiguous(memory_format=torch.channels_last)
         log_times(f"Cifar loader (bs={batch_size}, iters={TOTAL_ITERS})", t0, t1, t2, t3)
+    
+    with torch.profiler.profile(
+        profile_memory=True,
+        with_stack=True,
+    ) as prof:
+        with torch.profiler.record_function("iter"):
+            new_iter = iter(cifar_train_loader)
+        with torch.profiler.record_function("next"):
+            for _ in range(10):
+                batch, labels = next(new_iter)
+    
+    prof.export_chrome_trace(f"{BASE_DIR}/logs/loader-trace.json")
