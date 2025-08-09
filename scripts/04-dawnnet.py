@@ -23,7 +23,7 @@ import wandb
 
 # %% [markdown]
 """
-In this script, we implement the DAWNNet ResNet with the changes described in [*How to Train Your ResNet 1: Baseline*](https://web.archive.org/web/20221206112356/https://myrtle.ai/how-to-train-your-resnet-1-baseline/).
+In this script, we implement the DAWNNet ResNet with the changes described in [*How to Train Your ResNet 1: Baseline*](https://web.archive.org/web/20221206112356/https://myrtle.ai/how-to-train-your-resnet-1-baseline/) and [*How to Train Your ResNet 2: Mini-batches*](https://web.archive.org/web/20231207232347/https://myrtle.ai/learn/how-to-train-your-resnet-2-mini-batches/).
 
 Since we're starting to make more opinionated and idiosyncratic changes, we'll add wandb logging to more easily compare results across runs.
 
@@ -38,24 +38,25 @@ It's based on Ben Johnson's DAWNBench submission, which:
 - Pads with mode='reflect'.
 - Rather than simply average-pooling before the final linear layer, they apply both average-pooling and max-pooling, concatenate the results, and feed the result to the linear layer.
 
-Page makes the following changes:
+Page makes the following changes in his first article:
 - Removes the batchnorm + ReLU from the input stem, since they're redundant with the batchnorm + ReLU in the first residual block.
 - Removes some of the jumps in the learning rate schedule.
 - Preprocesses the dataset in advance. Rather than applying padding, normalization, and random horizontal flipping each time they load a batch, he pre-applies these. This leaves only random cropping and flipping.
 - He removes dataworkers to avoid the overhead associated with launching them. Keeping everything in the main thread saves time!
-- He scales the weight decay by the batch size and divides the learning rate by the batch size.
+- He uses reduction="sum" in his loss function, and scales the weight decay by the batch size to account for this.
 - He uses SGD with (PyTorch-style) Nesterov momentum.
+- He combines the random number calls into bulk calls up front.
 
-Our implementation departs from theirs in a few ways:
+In the second article, he further:
+- Slightly increases the learning rate.
+- Increases the batch size to 512, under very principled motivations. I highly recommend the article!
+
+Also see Page's [implementation notebook](https://github.com/davidcpage/cifar10-fast/blob/master/experiments.ipynb).
+
+Our implementation departs from his in a few ways:
 1. We use step-based (rather than epoch-based) scheduling.
-2. Oddly, they apply the first batchnorm + ReLU to both the residual stream and the convolution path (which hurts performance). It doesn't make a huge difference for a network this shallow, but I won't do this.
-3. We take a more aggressive approach to data loading by loading the entire dataset into GPU memory (in uint8) and applying pre-processing on-device during the first call to `__iter__`.
-
-TODO:
-- Combine random number calls into bulk calls up front (how did he do this?).
-
-[article](https://web.archive.org/web/20221206112356/https://myrtle.ai/how-to-train-your-resnet-1-baseline/)
-[notebook](https://github.com/davidcpage/cifar10-fast/blob/master/experiments.ipynb)
+2. Oddly, he applies the first batchnorm + ReLU to both the residual stream and the convolution path (which hurts performance). It doesn't make a huge difference for a network this shallow, but I won't do this.
+3. We take a more aggressive approach to data loading by loading the entire dataset into GPU memory (in uint8) and applying pre-processing on-device during the first call to `__iter__`. Tracing suggests we're only spending 4ms per epoch generating randperm indices and 29µs generating random numbers per batch. This comes out to about 0.24 seconds across the entire training run, so I don't think it's worth optimizing further yet.
 """
 
 # %% 1. Global Constants
@@ -95,11 +96,11 @@ class Config:
     "Set to 0 to disable evaluation."
     save_every: int = 14_000
     "Set to 0 to disable checkpointing. Must be a multiple of eval_every."
-    batch_size: int = 128
+    batch_size: int = 512
     momentum: float = 0.9
     "SGD momentum (not BatchNorm momentum)."
-    weight_decay: float = 5e-4 * batch_size
-    lrs: list[float] = field(default_factory=lambda: [0, 0.1, 0.005, 0])
+    weight_decay: float = 5e-4 * batch_size # this is very aggressive
+    lrs: list[float] = field(default_factory=lambda: [0, 0.44, 0.005, 0])
     "We linearly interpolate between these learning rates with np.interp(step, milestones, lrs)."
     milestones: list[int] = field(default_factory=lambda: [0, 6_000, 12_000, 14_001])
     "The number of steps at which we reach each learning rate. Last step is train_steps + 1 to avoid a final step with lr=0.0."
@@ -395,7 +396,7 @@ class DAWNTrainer:
 
             # 2. Forward pass.
             pred = self.model(batch)
-            loss = F.cross_entropy(pred, labels)
+            loss = F.cross_entropy(pred, labels, reduction="sum")
 
             # 3. Update our learning rate.
             # We do this before the optimizer step to avoid a first step with lr=0.0

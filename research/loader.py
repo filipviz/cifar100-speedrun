@@ -1,4 +1,45 @@
-# Prototyping and experimenting with our data loader.
+# %% [markdown]
+"""
+Prototyping and experimenting with our GPU-accelerated data loader. On a Runpod H100 SXM instance, we see significant speedups - especially at larger batch sizes!
+
+At batch size 128, we already see a 1.21x overall training speedup over the PyTorch dataloader. At batch size 2048, we see a 3.76x speedup! Note that we're using a smaller ResNet18 model here.
+
+=== Torch train (bs=128, iters=3000) ===
+Time to initialize: 0.847s
+Time for iter(): 0.106s
+Total training time: 49.322s
+Average time per step: 0.016s
+Total time: 50.275s
+Max memory allocated: 160 MiB
+Max memory reserved: 172 MiB
+
+=== Cifar train (bs=128, iters=3000) ===
+Time to initialize: 0.152s
+Time for iter(): 0.000s
+Total training time: 40.872s
+Average time per step: 0.014s
+Total time: 41.024s
+Max memory allocated: 1,277 MiB
+Max memory reserved: 1,618 MiB
+
+=== Torch train (bs=2048, iters=3000) ===
+Time to initialize: 1.347s
+Time for iter(): 0.225s
+Total training time: 171.822s
+Average time per step: 0.057s
+Total time: 173.394s
+Max memory allocated: 592 MiB
+Max memory reserved: 676 MiB
+
+=== Cifar train (bs=2048, iters=3000) ===
+Time to initialize: 0.137s
+Time for iter(): 0.000s
+Total training time: 45.719s
+Average time per step: 0.015s
+Total time: 45.856s
+Max memory allocated: 1,277 MiB
+Max memory reserved: 1,602 MiB
+"""
 # %%
 import contextlib
 from datetime import datetime
@@ -246,6 +287,7 @@ if __name__ == "__main__":
         cleanup()
 
         model, opt = model_and_opt()
+        title = f"Torch train (bs={batch_size}, iters={TOTAL_ITERS})"
         
         torch.cuda.synchronize()
         t0 = time.perf_counter()
@@ -265,7 +307,7 @@ if __name__ == "__main__":
 
         torch.cuda.synchronize()
         t2 = time.perf_counter()
-        for _ in trange(TOTAL_ITERS, desc="Torch train"):
+        for _ in trange(TOTAL_ITERS, desc=title):
             try:
                 batch, labels = next(torch_train_iter)
             except StopIteration:
@@ -284,13 +326,14 @@ if __name__ == "__main__":
         torch.cuda.synchronize()
         t3 = time.perf_counter()
         assert batch.is_contiguous(memory_format=torch.channels_last)
-        log_times(f"Torch loader (bs={batch_size}, iters={TOTAL_ITERS})", t0, t1, t2, t3)
+        log_times(title, t0, t1, t2, t3)
         
         del model, opt, torch_train_loader, torch_train_iter, batch, labels, out, loss
         cleanup()
 
         model, opt = model_and_opt()
         cfg = Config(batch_size=batch_size)
+        title = f"Cifar train (bs={batch_size}, iters={TOTAL_ITERS})"
         
         torch.cuda.synchronize()
         t0 = time.perf_counter()
@@ -302,7 +345,7 @@ if __name__ == "__main__":
 
         torch.cuda.synchronize()
         t2 = time.perf_counter()
-        for _ in trange(TOTAL_ITERS, desc="Cifar train"):
+        for _ in trange(TOTAL_ITERS, desc=title):
             batch, labels = next(cifar_train_iter)
             out = model(batch)
             loss = F.cross_entropy(out, labels)
@@ -313,7 +356,7 @@ if __name__ == "__main__":
         torch.cuda.synchronize()
         t3 = time.perf_counter()
         assert batch.is_contiguous(memory_format=torch.channels_last)
-        log_times(f"Cifar loader (bs={batch_size}, iters={TOTAL_ITERS})", t0, t1, t2, t3)
+        log_times(title, t0, t1, t2, t3)
     
     with torch.profiler.profile(
         profile_memory=True,
