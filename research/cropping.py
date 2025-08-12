@@ -21,7 +21,7 @@ torch.set_float32_matmul_precision('high')
 # Load CIFAR100 data
 cifar = CIFAR100(root='./data', train=True, download=True)
 imgs = torch.tensor(cifar.data).to('cuda')
-imgs = rearrange(imgs, 'b h w c -> b c h w').to(torch.bfloat16, memory_format=torch.channels_last) / 255.0
+imgs = rearrange(imgs, 'b h w c -> b c h w').to(torch.float16, memory_format=torch.channels_last) / 255.0
 
 # Methods assume images are already padded.
 img_pad = F.pad(imgs, (4,) * 4, mode='constant', value=0)

@@ -63,13 +63,13 @@ import torch.nn.functional as F
 from tqdm import trange
 # %%
 
-assert torch.cuda.is_available(), "This script requires a CUDA-enabled GPU."
+# assert torch.cuda.is_available(), "This script requires a CUDA-enabled GPU."
 
 torch.backends.cudnn.benchmark = True
 
 BASE_DIR = os.path.dirname(__file__)
 DATA_DIR = f"{BASE_DIR}/data"
-DEVICE = 'cuda'
+DEVICE = 'mps'
 DTYPE = torch.float16
 CIFAR100_MEAN = torch.tensor((0.5078125, 0.486328125, 0.44140625), dtype=DTYPE, device=DEVICE)
 CIFAR100_STD = torch.tensor((0.267578125, 0.255859375, 0.275390625), dtype=DTYPE, device=DEVICE)
@@ -86,7 +86,7 @@ class Config:
     pad_mode: Literal['reflect', 'constant'] = 'reflect'
     crop_padding: int = 4
     "Set to 0 to disable padding and random cropping."
-    cutout_size: int = 0
+    cutout_size: int = 8
     "Set to 0 to disable cutout."
 
 def batch_crop(images: Float[Tensor, "b c h_in w_in"], crop_size: int = 32) -> Float[Tensor, "b c h_out w_out"]:
@@ -199,6 +199,8 @@ class Cifar100Loader:
                     images = batch_crop(images, crop_size=32)
                 if self.cfg.flip:
                     images = batch_flip_lr(images)
+                if self.cfg.cutout_size > 0:
+                    images = batch_cutout(images, size=self.cfg.cutout_size)
 
             yield images, labels
 
