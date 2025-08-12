@@ -19,13 +19,10 @@ from torchvision.datasets import CIFAR100
 from tqdm import tqdm
 from jaxtyping import Float
 from tabulate import tabulate
-import wandb
 
 # %% [markdown]
 """
 In this script, we implement the DAWNNet ResNet with the changes described in [*How to Train Your ResNet 1: Baseline*](https://web.archive.org/web/20221206112356/https://myrtle.ai/how-to-train-your-resnet-1-baseline/) and [*How to Train Your ResNet 2: Mini-batches*](https://web.archive.org/web/20231207232347/https://myrtle.ai/learn/how-to-train-your-resnet-2-mini-batches/).
-
-Since we're starting to make more opinionated and idiosyncratic changes, we'll add wandb logging to more easily compare results across runs.
 
 It's based on Ben Johnson's DAWNBench submission, which:
 - Is an 18-layer pre-activation ResNet.
@@ -121,17 +118,9 @@ class Config:
     "Set to 0 to disable seeding."
     n_workers: int = 12
 
-    # --- wandb --- #
-    wandb_project: str | None = None
-    wandb_name: str | None = None
-    use_wandb: bool = False
-    
     def __post_init__(self):
         assert len(self.group_c_ins) == len(self.group_n_blocks) == len(self.group_downsample)
         assert self.save_every % self.eval_every == 0, "save_every must be a multiple of eval_every"
-
-        if self.use_wandb:
-            assert self.wandb_project and self.wandb_name, "must set wandb_project and wandb_name if use_wandb is True"
 
         # block layers + 1 input layer + 1 output layer.
         self.layers = 2 * sum(self.group_n_blocks) + 2
@@ -364,16 +353,6 @@ class DAWNTrainer:
         if self.cfg.save_every > 0:
             os.makedirs("checkpoints", exist_ok=True)
         
-        if self.cfg.use_wandb:
-            wandb.init(
-                project=self.cfg.wandb_project,
-                name=self.cfg.wandb_name,
-                config=vars(self.cfg),
-                config_exclude_keys=["wandb_project", "wandb_name", "use_wandb"],
-                save_code=True,
-            )
-        # wandb.watch(self.model, log="all", log_freq=cfg.eval_every)
-    
     def get_lr(self, step: int) -> float:
         return np.interp(step, self.cfg.milestones, self.cfg.lrs).item() / self.cfg.batch_size
 
@@ -441,9 +420,6 @@ class DAWNTrainer:
                 }
                 logging.info(ROW_FMT.format(*[metrics[col] for col in LOGGING_COLUMNS]))
                 pbar.set_postfix(train_loss=metrics['train_loss'], test_loss=metrics['test_loss'])
-                if self.cfg.use_wandb:
-                    del metrics['step']
-                    wandb.log(metrics, step=step)
                 
                 # Start the clock again.
                 torch.cuda.synchronize()
@@ -452,7 +428,6 @@ class DAWNTrainer:
         torch.cuda.synchronize()
         training_time += time.perf_counter() - t0
         logging.info(f"Total training time: {training_time:,.2f}s")
-        wandb.finish()
     
     @torch.no_grad()
     def evaluate(self) -> dict[str, float]:
