@@ -71,8 +71,8 @@ BASE_DIR = os.path.dirname(__file__)
 DATA_DIR = f"{BASE_DIR}/data"
 DEVICE = 'mps'
 DTYPE = torch.float16
-CIFAR100_MEAN = torch.tensor((0.5078125, 0.486328125, 0.44140625), dtype=DTYPE, device=DEVICE)
-CIFAR100_STD = torch.tensor((0.267578125, 0.255859375, 0.275390625), dtype=DTYPE, device=DEVICE)
+CIFAR100_MEAN = torch.tensor((0.5068359375, 0.486572265625, 0.44091796875), dtype=DTYPE, device=DEVICE)
+CIFAR100_STD = torch.tensor((0.267333984375, 0.25634765625, 0.276123046875), dtype=DTYPE, device=DEVICE)
 CPU_MEAN, CPU_STD = CIFAR100_MEAN.cpu(), CIFAR100_STD.cpu()
 TOTAL_ITERS = 3_000
 
@@ -90,7 +90,7 @@ class Config:
     "Set to 0 to disable cutout."
 
 def batch_crop(images: Float[Tensor, "b c h_in w_in"], crop_size: int = 32) -> Float[Tensor, "b c h_out w_out"]:
-    """View-based batch cropping."""
+    """Strided view-based (in-place) batch cropping."""
     b, c, h, w = images.shape
     r = (h - crop_size) // 2
  
@@ -105,35 +105,34 @@ def batch_crop(images: Float[Tensor, "b c h_in w_in"], crop_size: int = 32) -> F
     
     # Select the appropriate crop for each image.
     batch_idx = torch.arange(b, device=images.device)
-    shifts = torch.randint(0, 2*r+1, size=(2, b), device=images.device)
-    return crops[batch_idx, :, shifts[0], shifts[1]]
+    shift_h = torch.randint(0, 2*r+1, size=(b,), device=images.device)
+    shift_w = torch.randint(0, 2*r+1, size=(b,), device=images.device)
+    return crops[batch_idx, :, shift_h, shift_w]
 
 def batch_flip_lr(images: Float[Tensor, "b c h w"]) -> Float[Tensor, "b c h w"]:
     """Apply random horizontal flipping to each image in the batch"""
-    flip_mask = (torch.rand(len(images), device=images.device) < 0.5).view(-1, 1, 1, 1)
-    return torch.where(flip_mask, images.flip(-1), images)
+    flip_mask = torch.rand(len(images), device=images.device) < 0.5
+    images[flip_mask] = images[flip_mask].flip(-1)
+    return images
 
 def batch_cutout(images: Float[Tensor, "b c h w"], size: int) -> Float[Tensor, "b c h w"]:
-    """
-    Apply cutout augmentation to batch of images
-    TODO: If we actually use this we should make it more efficient.
-    """
+    """In-place vectorized cutout using advanced indexing."""
     if size <= 0:
         return images
-    
-    batch_size, _, h, w = images.shape
-    cutout_y = torch.randint(0, h, (batch_size,), device=images.device)
-    cutout_x = torch.randint(0, w, (batch_size,), device=images.device)
-    
-    y1 = torch.clamp(cutout_y - size // 2, 0, h)
-    y2 = torch.clamp(cutout_y + size // 2, 0, h)
-    x1 = torch.clamp(cutout_x - size // 2, 0, w)
-    x2 = torch.clamp(cutout_x + size // 2, 0, w)
-    
-    images = images.clone()
-    for i in range(batch_size):
-        images[i, :, y1[i]:y2[i], x1[i]:x2[i]] = 0
-    
+    b, c, h, w = images.shape
+    dev = images.device
+    lo = size // 2
+    hi = size - lo
+
+    h_center = torch.randint(0, h, (b, 1, 1), device=dev)
+    w_center = torch.randint(0, w, (b, 1, 1), device=dev)
+    dh = torch.arange(-lo, hi, device=dev).view(1, size, 1)
+    dw = torch.arange(-lo, hi, device=dev).view(1, 1, size)
+    h_idx = (h_center + dh).clamp(0, h - 1)
+    w_idx = (w_center + dw).clamp(0, w - 1)
+    b_idx = torch.arange(b, device=dev).view(b, 1, 1)
+
+    images[b_idx, :, h_idx, w_idx] = 0
     return images
 
 class Cifar100Loader:

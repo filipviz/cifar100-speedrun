@@ -317,7 +317,7 @@ class BottleneckTrainer:
         )
 
         if self.cfg.save_every > 0:
-            os.makedirs("checkpoints", exist_ok=True)
+            os.makedirs(f"{BASE_DIR}/checkpoints", exist_ok=True)
     
     def train(self):
         self.model.train()
@@ -368,7 +368,7 @@ class BottleneckTrainer:
                         'optimizer': self.opt.state_dict(),
                         'scheduler': self.scheduler.state_dict(),
                         'step': step,
-                    }, f"checkpoints/run-{self.cfg.run_id}-step-{step}.pt")
+                    }, f"{BASE_DIR}/checkpoints/run-{self.cfg.run_id}-step-{step}.pt")
                 
                 self.model.eval()
                 test_metrics = self.evaluate()

@@ -1,4 +1,11 @@
-# Benchmark different cutout methods.
+# %% [markdown]
+"""
+Benchmarking different cutout methods. On a 3060:
+- The naive implementation averages ~4.78 s.
+- The mask-based implementation cuts this down to 3.90 ms.
+- Our final indexing-based implementation brings us to 790.73 us.
+A 6045x speedup!
+"""
 # %%
 import torch
 from torch.utils import benchmark
@@ -6,8 +13,6 @@ from torch import Tensor
 from jaxtyping import Float
 from torchvision.datasets import CIFAR100
 from einops import rearrange
-
-assert torch.cuda.is_available(), "This script requires a CUDA-enabled GPU."
 
 # %%
 
@@ -40,14 +45,14 @@ def batch_cutout_mask(images: Float[Tensor, "b c h w"], size: int) -> Float[Tens
 
     lo = size // 2
     hi = size - lo
-    center_h, center_w = torch.randint(0, w, (2, b, 1, 1, 1), device=dev)
+    center_h = torch.randint(0, h, (b, 1, 1, 1), device=dev)
+    center_w = torch.randint(0, w, (b, 1, 1, 1), device=dev)
 
     min_h = torch.clamp_min(center_h - lo, 0)
     min_w = torch.clamp_min(center_w - lo, 0)
 
-    # We don't need to clamp max values - PyTorch automatically handles this.
-    max_h = center_h + hi
-    max_w = center_w + hi
+    max_h = torch.clamp_max(center_h + hi, h - 1)
+    max_w = torch.clamp_max(center_w + hi, w - 1)
     
     hs = torch.arange(h, device=dev).view(1, 1, h, 1)
     ws = torch.arange(w, device=dev).view(1, 1, 1, w)
@@ -58,36 +63,42 @@ def batch_cutout_mask(images: Float[Tensor, "b c h w"], size: int) -> Float[Tens
     return images
 
 def batch_cutout_sparse(images: Float[Tensor, "b c h w"], size: int) -> Float[Tensor, "b c h w"]:
+    """Vectorized cutout using advanced indexing."""
     if size <= 0:
         return images
     b, c, h, w = images.shape
     dev = images.device
-    
+
     lo = size // 2
     hi = size - lo
-    center_h, center_w = torch.randint(0, w, (2, b, 1, 1, 1), device=dev)
-    
-    hs = center_h + torch.arange(-lo, hi, device=dev).view(1, size, 1)
-    ws = center_w + torch.arange(-lo, hi, device=dev).view(1, 1, size)
-    
-    b_idx = torch.arange(b, device=dev).view(b, 1, 1, 1)
-    c_idx = torch.arange(c, device=dev).view(1, c, 1, 1)
-    
-    images[b_idx, c_idx, hs, ws] = 0
+
+    h_center = torch.randint(0, h, (b, 1, 1), device=dev)
+    w_center = torch.randint(0, w, (b, 1, 1), device=dev)
+
+    dh = torch.arange(-lo, hi, device=dev).view(1, size, 1)
+    dw = torch.arange(-lo, hi, device=dev).view(1, 1, size)
+
+    h_idx = (h_center + dh).clamp(0, h - 1)
+    w_idx = (w_center + dw).clamp(0, w - 1)
+    b_idx = torch.arange(b, device=dev).view(b, 1, 1)
+
+    images[b_idx, :, h_idx, w_idx] = 0
     return images
 
 # %% 
 
-device, dtype = 'cuda', torch.float16
+if __name__ == '__main__':
+    assert torch.cuda.is_available(), "This script requires a CUDA-enabled GPU."
+    device, dtype = 'cuda', torch.float16
 
-cifar = CIFAR100(root='../data', train=True, download=True)
-imgs = torch.tensor(cifar.data).to(device)
-imgs = rearrange(imgs, 'b h w c -> b c h w') #.to(dtype, memory_format=torch.channels_last) / 255.0
+    cifar = CIFAR100(root='data', train=True, download=True)
+    imgs = torch.tensor(cifar.data).to(device)
+    imgs = rearrange(imgs, 'b h w c -> b c h w').to(dtype, memory_format=torch.channels_last) / 255.0
 
-for impl in [batch_cutout_naive, batch_cutout_mask, batch_cutout_sparse]:
-    t = benchmark.Timer(
-        stmt='impl(images, 8)',
-        setup='images = imgs.clone()',
-        globals={'impl': impl, 'imgs': imgs},
-    )
-    print(f"{impl.__name__}: {t.timeit(10)}")
+    for impl in [batch_cutout_naive, batch_cutout_mask, batch_cutout_sparse]:
+        t = benchmark.Timer(
+            stmt='impl(images, 8)',
+            setup='images = imgs.clone()',
+            globals={'impl': impl, 'imgs': imgs},
+        )
+        print(f"{impl.__name__}: {t.timeit(100)}")

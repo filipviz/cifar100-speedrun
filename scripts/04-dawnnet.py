@@ -116,7 +116,6 @@ class Config:
     float32_matmul_precision: Literal['highest', 'high', 'medium'] = 'medium'
     seed: int = 20250802
     "Set to 0 to disable seeding."
-    n_workers: int = 12
 
     def __post_init__(self):
         assert len(self.group_c_ins) == len(self.group_n_blocks) == len(self.group_downsample)
@@ -351,7 +350,7 @@ class DAWNTrainer:
         )
         
         if self.cfg.save_every > 0:
-            os.makedirs("checkpoints", exist_ok=True)
+            os.makedirs(f"{BASE_DIR}/checkpoints", exist_ok=True)
         
     def get_lr(self, step: int) -> float:
         return np.interp(step, self.cfg.milestones, self.cfg.lrs).item() / self.cfg.batch_size
@@ -401,7 +400,7 @@ class DAWNTrainer:
                         'model': self.model.state_dict(),
                         'optimizer': self.opt.state_dict(),
                         'step': step,
-                    }, f"checkpoints/run-{self.cfg.run_id}-step-{step}.pt")
+                    }, f"{BASE_DIR}/checkpoints/run-{self.cfg.run_id}-step-{step}.pt")
                 
                 self.model.eval()
                 test_metrics = self.evaluate()
