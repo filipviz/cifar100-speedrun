@@ -4,7 +4,7 @@ import subprocess
 import sys
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from typing import Literal
 import logging
 
@@ -17,6 +17,7 @@ from torchvision.datasets import CIFAR100
 from tqdm import tqdm
 from jaxtyping import Float
 from tabulate import tabulate
+import wandb
 
 # %% [markdown]
 """
@@ -38,10 +39,16 @@ In [part 4](https://web.archive.org/web/20231108123408/https://myrtle.ai/learn/h
     - Scaling the final classifier layer by 0.125.
 - He then applies brute force architecture search, finding that adding residual blocks (consisting of two 3x3 convolutions -> batchnorm -> ReLU sequences with identity shortcuts) after the pooling in the first and third layers performs well. With this architecture he achieves 94.08% accuracy in 79s!
 
+This is the first time that one of Page's networks fails to generalize to CIFAR-100! Some brief testing suggests the learning rate is far too high.
+
 In our implementation, we:
+- Add wandb and set up a hyperparameter sweep.
 - Continue using step-based scheduling (rather than epoch-based scheduling).
 - Use mean reduction for our loss. As a result, we don't scale down our learning rate.
-- Use a weight decay of 0.1. His implementation implicitly uses weight_decay=0.384, which is very aggressive.
+- Rather than linear warmup and decay, we use a shorter linear warmup and cosine decay.
+- We add autocast and grad scaling to improve numerical stability.
+
+Since the network is smaller now, we'll use wandb to sweep over hyperparameters.
 """
 
 # %% 1. Global Constants
@@ -49,9 +56,8 @@ In our implementation, we:
 BASE_DIR = f"{os.path.dirname(__file__)}/.."
 DATA_DIR = f"{BASE_DIR}/data"
 DEVICE = "cuda"
-DTYPE = torch.float16
 
-LOGGING_COLUMNS = ['step', 'time', 'interval_time', 'lr', 'train_loss', 'train_acc1',
+LOGGING_COLUMNS = ['step', 'time', 'interval', 'lr', 'train_loss', 'train_acc1',
                    'train_acc5', 'test_loss', 'test_acc1', 'test_acc5']
 HEADER_FMT = "|{:^6s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|"
 ROW_FMT = "|{:>6d}|{:>10,.3f}|{:>10,.3f}|{:>10,.3e}|{:>10,.3f}|{:>10.3%}|{:>10.3%}|{:>10,.3f}|{:>10.3%}|{:>10.3%}|"
@@ -71,20 +77,27 @@ class Config:
     "We scale the final classifier layer by this amount."
     
     # --- Training --- #
-    train_steps: int = 1_563
+    train_steps: int = 1_500
     "Number of mini-batch iterations we train for."
-    eval_every: int = 500
+    eval_every: int = 100
     "Set to 0 to disable evaluation."
     save_every: int = 0
     "Set to 0 to disable checkpointing. Must be a multiple of eval_every."
     batch_size: int = 768
     momentum: float = 0.9
     "SGD momentum (not BatchNorm momentum)."
-    weight_decay: float = 0.1
-    lrs: list[float] = field(default_factory=lambda: [0, 0.4, 0])
-    "We linearly interpolate between these learning rates with np.interp(step, milestones, lrs)."
-    milestones: list[int] = field(default_factory=lambda: [0, 326, 1563+1])
-    "The number of steps at which we reach each learning rate. Last step is train_steps + 1 to avoid a final step with lr=0.0."
+    nesterov: bool = False
+    "Whether to use Nesterov momentum (SGD only)."
+    beta_2: float = 0.999
+    "AdamW beta_2."
+    weight_decay: float = 0.01
+    "Weight decay."
+    max_lr: float = 3e-2
+    "Our maximum learning rate."
+    warmup_steps: int = 300
+    "The number of steps over which we linearly increase the learning rate from 0 to max_lr."
+    optimizer: Literal['sgd', 'adamw'] = 'sgd'
+    "The optimizer to use."
     
     # --- Data Augmentation --- #
     flip: bool = True
@@ -96,16 +109,26 @@ class Config:
     "Set to 0 to disable cutout."
     
     # --- Setup and Flags --- #
+    dtype: Literal['fp16', 'bf16', 'fp32'] = 'fp16'
     allow_tf32: bool = True
     cudnn_benchmark: bool = True
     cudnn_deterministic: bool = False
     float32_matmul_precision: Literal['highest', 'high', 'medium'] = 'medium'
     seed: int = 20250812
     "Set to 0 to disable seeding."
+    
+    # --- Wandb --- #
+    use_wandb: bool = True
+    wandb_project: str = "backbone-resnet"
+    wandb_note: str = ""
+    sweep_count: int = 50
 
     def __post_init__(self):
+        assert 0 <= self.warmup_steps <= self.train_steps, "warmup_steps must be between 0 and train_steps"
         if self.eval_every > 0:
             assert self.save_every % self.eval_every == 0, "save_every must be a multiple of eval_every"
+        if self.use_wandb:
+            assert self.wandb_project, "Must specify a wandb_project"
             
 # %% 3. Model
 
@@ -180,8 +203,8 @@ class BackboneResnet(nn.Module):
 
 # %% 4. Dataset and Augmentation
 
-CIFAR100_MEAN = torch.tensor((0.5068359375, 0.486572265625, 0.44091796875), dtype=DTYPE, device=DEVICE)
-CIFAR100_STD = torch.tensor((0.267333984375, 0.25634765625, 0.276123046875), dtype=DTYPE, device=DEVICE)
+CIFAR100_MEAN = torch.tensor((0.507076, 0.486550, 0.440919), device=DEVICE)
+CIFAR100_STD = torch.tensor((0.267334, 0.256438, 0.276150), device=DEVICE)
 
 def batch_crop(images: Float[Tensor, "b c h_in w_in"], crop_size: int = 32) -> Float[Tensor, "b c h_out w_out"]:
     """Strided view-based (in-place) batch cropping."""
@@ -250,8 +273,9 @@ class Cifar100Loader:
         data = torch.load(cifar_path, map_location=device)
         self.images, self.labels, self.classes = data['images'], data['labels'], data['classes']
         
-        # Convert to fp16, normalize, and rearrange on GPU
-        self.images = self.images.to(DTYPE) / 255.0
+        # Convert to floats, normalize, and rearrange on GPU.
+        # I tried doing this in fp16 but it didn't make a difference.
+        self.images = self.images.to(torch.float32) / 255.0
         self.images = (self.images - CIFAR100_MEAN) / CIFAR100_STD
         if self.train and cfg.crop_padding > 0:
             self.images = F.pad(self.images, (0, 0) + (cfg.crop_padding,) * 4, mode=cfg.pad_mode)
@@ -303,33 +327,60 @@ class BackboneTrainer:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.device = torch.device("cuda")
+        self.dtype = {
+            'fp16': torch.float16,
+            'bf16': torch.bfloat16,
+            'fp32': torch.float32,
+        }[self.cfg.dtype]
         
         self.train_loader = Cifar100Loader(cfg, train=True, device=self.device)
         self.test_loader = Cifar100Loader(cfg, train=False, device=self.device)
 
         self.model = BackboneResnet(cfg).to(
             device=self.device,
-            dtype=DTYPE, 
             memory_format=torch.channels_last
         )
-        # for m in self.model.modules():
-        #     if isinstance(m, nn.BatchNorm2d):
-        #         m.to(dtype=torch.float32).to(dtype=torch.float32)
 
-        self.opt = torch.optim.SGD(
-            self.model.parameters(),
-            lr=0.0,
-            momentum=cfg.momentum,
-            weight_decay=cfg.weight_decay,
-            nesterov=True,
-            fused=True,
+        if cfg.optimizer == 'sgd':
+            self.opt = torch.optim.SGD(
+                self.model.parameters(),
+                lr=self.cfg.max_lr,
+                momentum=cfg.momentum,
+                weight_decay=cfg.weight_decay,
+                nesterov=cfg.nesterov,
+                fused=True,
+            )
+        elif cfg.optimizer == 'adamw':
+            self.opt = torch.optim.AdamW(
+                self.model.parameters(),
+                betas=(cfg.momentum, cfg.beta_2),
+                lr=self.cfg.max_lr,
+                weight_decay=cfg.weight_decay,
+                fused=True,
+            )
+        else:
+            raise ValueError(f"Invalid optimizer: {cfg.optimizer}")
+        
+        warmup = torch.optim.lr_scheduler.LinearLR(
+            self.opt,
+            start_factor=1e-5,
+            end_factor=1.0,
+            total_iters=self.cfg.warmup_steps,
+        )
+        cosine_decay = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.opt,
+            T_max=self.cfg.train_steps - self.cfg.warmup_steps,
+            eta_min=0.0,
+        )
+
+        self.scheduler = torch.optim.lr_scheduler.SequentialLR(
+            self.opt,
+            schedulers=[warmup, cosine_decay],
+            milestones=[self.cfg.warmup_steps],
         )
         
         if self.cfg.save_every > 0:
             os.makedirs(f"{BASE_DIR}/checkpoints", exist_ok=True)
-        
-    def get_lr(self, step: int) -> float:
-        return np.interp(step, self.cfg.milestones, self.cfg.lrs).item()
 
     def train(self):
         self.model.train()
@@ -342,6 +393,7 @@ class BackboneTrainer:
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         
+        scaler = torch.GradScaler(enabled=(self.dtype == torch.float16))
         for step in pbar:
             # ---- Training ---- #
 
@@ -349,17 +401,24 @@ class BackboneTrainer:
             batch, labels = next(loader_iter)
 
             # 2. Forward pass.
-            pred = self.model(batch)
-            loss = F.cross_entropy(pred, labels)
+            with torch.autocast(self.device.type, dtype=self.dtype):
+                pred = self.model(batch)
+                loss = F.cross_entropy(pred, labels)
 
-            # 3. Update our learning rate.
-            # We do this before the optimizer step to avoid a first step with lr=0.0
-            self.opt.param_groups[0]['lr'] = self.get_lr(step)
+            # 3. Backward pass.
             self.opt.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            scaler.step(self.opt)
+            scaler.update()
 
-            # 4. Backward pass.
-            loss.backward()
-            self.opt.step()
+            # 4. Update our learning rate.
+            self.scheduler.step()
+            
+            if self.cfg.use_wandb:
+                wandb.log({
+                    'train_loss': loss.item(),
+                    'lr': self.scheduler.get_last_lr()[0],
+                }, step)
 
             # ---- Evaluation ---- #
             last_step = step == self.cfg.train_steps
@@ -386,7 +445,7 @@ class BackboneTrainer:
                 metrics = {
                     "step": step, 
                     "time": training_time,
-                    "interval_time": interval_time,
+                    "interval": interval_time,
                     "lr": self.opt.param_groups[0]['lr'],
                     "train_loss": loss.item(),
                     "train_acc1": (pred.argmax(dim=1) == labels).float().mean().item(),
@@ -395,6 +454,10 @@ class BackboneTrainer:
                 }
                 logging.info(ROW_FMT.format(*[metrics[col] for col in LOGGING_COLUMNS]))
                 pbar.set_postfix(train_loss=metrics['train_loss'], test_loss=metrics['test_loss'])
+
+                if self.cfg.use_wandb:
+                    del metrics['step']
+                    wandb.log(metrics, step)
                 
                 # Start the clock again.
                 torch.cuda.synchronize()
@@ -404,18 +467,19 @@ class BackboneTrainer:
         training_time += time.perf_counter() - t0
         logging.info(f"Total training time: {training_time:,.2f}s")
     
-    @torch.no_grad()
+    @torch.inference_mode()
     def evaluate(self) -> dict[str, float]:
         assert not self.model.training, "Model must be in eval mode"
         items = self.test_loader.n_images
-        cum_loss = torch.tensor(0.0, device="cuda")
-        n_correct_top1 = torch.tensor(0.0, device="cuda")
-        n_correct_top5 = torch.tensor(0.0, device="cuda")
+        cum_loss = torch.tensor(0.0, device=self.device)
+        n_correct_top1 = torch.tensor(0.0, device=self.device)
+        n_correct_top5 = torch.tensor(0.0, device=self.device)
 
         pbar = tqdm(self.test_loader, desc="Evaluating", position=1, leave=False)
         for batch, labels in pbar:
-            pred = self.model(batch)
-            loss = F.cross_entropy(pred, labels, reduction="sum")
+            with torch.autocast(self.device.type, dtype=self.dtype):
+                pred = self.model(batch)
+                loss = F.cross_entropy(pred, labels, reduction="sum")
 
             cum_loss += loss
             n_correct_top1 += (pred.argmax(dim=1) == labels).sum()
@@ -454,12 +518,63 @@ if __name__ == "__main__":
     logging.info(f"Running CUDA {torch.version.cuda} and cuDNN {torch.backends.cudnn.version()}")
     logging.info(torch.cuda.get_device_name())
     logging.info(tabulate(vars(cfg).items(), headers=["Config Field", "Value"]))
-    
-    # Train our model
-    trainer = BackboneTrainer(cfg)
-    logging.info(HEADER_FMT.format(*LOGGING_COLUMNS))
-    logging.info(HEADER_FMT.format(*['---' for _ in LOGGING_COLUMNS]))
-    trainer.train()
+
+    if cfg.use_wandb:
+        def train_fn():
+            name = datetime.now().isoformat(timespec="seconds")
+            parsed_cfg = wandb.helper.parse_config(
+                asdict(cfg), 
+                exclude=('use_wandb', 'wandb_project', 'wandb_note', 'sweep_count')
+            )
+
+            with wandb.init(
+                project=cfg.wandb_project,
+                dir=f"{BASE_DIR}/wandb",
+                config=parsed_cfg,
+                name=name,
+                notes=cfg.wandb_note,
+                save_code=True,
+            ) as run:
+                logging.info(f"New run {name} with config {run.config}")
+                run_cfg = Config(**run.config)
+                logging.info(HEADER_FMT.format(*LOGGING_COLUMNS))
+                logging.info(HEADER_FMT.format(*['---' for _ in LOGGING_COLUMNS]))
+
+                trainer = BackboneTrainer(run_cfg)
+                run.watch(trainer.model, log="all", log_freq=cfg.eval_every)
+                trainer.train()
+
+        sweep_config = {
+            "method": "random",
+            "metric": {"goal": "maximize", "name": "test_acc5"},
+            "parameters": {
+                "dtype": {"values": ["fp16", "bf16"]},
+                "fc_scale": {"min": 0.03, "max": 1.0, "distribution": "log_uniform_values"},
+
+                "optimizer": {"values": ["sgd", "adamw"]},
+                "max_lr": {"min": 1e-4, "max": 0.5, "distribution": "log_uniform_values"},
+                "warmup_steps": {"min": 0, "max": 600, "distribution": "int_uniform"},
+
+                "weight_decay": {"min": 1e-6, "max": 0.2, "distribution": "uniform"},
+                "momentum": {"min": 0.8, "max": 0.99, "distribution": "uniform"},
+                "beta_2": {"min": 0.93, "max": 0.9999, "distribution": "uniform"},
+                "nesterov": {"values": [True, False]},
+            },
+            "early_terminate": {
+                "type": "hyperband",
+                "max_iter": ...,
+                "eta": ...,
+                "s": ...,
+            },
+        }
+        sweep_id = wandb.sweep(sweep_config, project=cfg.wandb_project)
+        wandb.agent(sweep_id, train_fn, project=cfg.wandb_project, count=cfg.sweep_count)
+
+    else:
+        logging.info(HEADER_FMT.format(*LOGGING_COLUMNS))
+        logging.info(HEADER_FMT.format(*['---' for _ in LOGGING_COLUMNS]))
+        trainer = BackboneTrainer(cfg)
+        trainer.train()
     
     try:
         smi = subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)

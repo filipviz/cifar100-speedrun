@@ -54,7 +54,7 @@ assert torch.cuda.is_available(), "This script requires a CUDA-enabled GPU."
 BASE_DIR = f"{os.path.dirname(__file__)}/.."
 DATA_DIR = f"{BASE_DIR}/data"
 
-LOGGING_COLUMNS = ['step', 'time', 'interval_time', 'lr', 'train_loss', 'train_acc1',
+LOGGING_COLUMNS = ['step', 'time', 'interval', 'lr', 'train_loss', 'train_acc1',
                    'train_acc5', 'test_loss', 'test_acc1', 'test_acc5']
 HEADER_FMT = "|{:^6s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|"
 ROW_FMT = "|{:>6d}|{:>10,.3f}|{:>10,.3f}|{:>10,.3e}|{:>10,.3f}|{:>10.3%}|{:>10.3%}|{:>10,.3f}|{:>10.3%}|{:>10.3%}|"
@@ -378,7 +378,7 @@ class BottleneckTrainer:
                 metrics = {
                     "step": step, 
                     "time": training_time,
-                    "interval_time": interval_time,
+                    "interval": interval_time,
                     "lr": self.scheduler.get_last_lr()[0],
                     "train_loss": loss.item(),
                     "train_acc1": (pred.argmax(dim=1) == labels).float().mean().item(),

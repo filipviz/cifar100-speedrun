@@ -65,7 +65,7 @@ DATA_DIR = f"{BASE_DIR}/data"
 DEVICE = "cuda"
 DTYPE = torch.float16
 
-LOGGING_COLUMNS = ['step', 'time', 'interval_time', 'lr', 'train_loss', 'train_acc1',
+LOGGING_COLUMNS = ['step', 'time', 'interval', 'lr', 'train_loss', 'train_acc1',
                    'train_acc5', 'test_loss', 'test_acc1', 'test_acc5']
 HEADER_FMT = "|{:^6s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|"
 ROW_FMT = "|{:>6d}|{:>10,.3f}|{:>10,.3f}|{:>10,.3e}|{:>10,.3f}|{:>10.3%}|{:>10.3%}|{:>10,.3f}|{:>10.3%}|{:>10.3%}|"
@@ -410,9 +410,9 @@ class DAWNTrainer:
                 metrics = {
                     "step": step, 
                     "time": training_time,
-                    "interval_time": interval_time,
+                    "interval": interval_time,
                     "lr": self.opt.param_groups[0]['lr'],
-                    "train_loss": loss.item(),
+                    "train_loss": loss.item() / self.cfg.batch_size,
                     "train_acc1": (pred.argmax(dim=1) == labels).float().mean().item(),
                     "train_acc5": (pred.topk(5)[1] == labels.view(-1, 1)).any(dim=1).float().mean().item(),
                     **test_metrics,
