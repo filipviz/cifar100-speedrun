@@ -39,16 +39,13 @@ In [part 4](https://web.archive.org/web/20231108123408/https://myrtle.ai/learn/h
     - Scaling the final classifier layer by 0.125.
 - He then applies brute force architecture search, finding that adding residual blocks (consisting of two 3x3 convolutions -> batchnorm -> ReLU sequences with identity shortcuts) after the pooling in the first and third layers performs well. With this architecture he achieves 94.08% accuracy in 79s!
 
-This is the first time that one of Page's networks fails to generalize to CIFAR-100! Some brief testing suggests the learning rate is far too high.
-
-In our implementation, we:
-- Add wandb and set up a hyperparameter sweep.
-- Continue using step-based scheduling (rather than epoch-based scheduling).
-- Use mean reduction for our loss. As a result, we don't scale down our learning rate.
-- Rather than linear warmup and decay, we use a shorter linear warmup and cosine decay.
-- We add autocast and grad scaling to improve numerical stability.
-
-Since the network is smaller now, we'll use wandb to sweep over hyperparameters.
+In our implementation:
+- We use cosine decay rather than the linear decay Page uses.
+- We also add wandb and set up a hyperparameter sweep.
+    - At first, most runs fail to converge due to under/overflows and poor numerical stability.
+    - Training becomes much more stable when we add autocast and grad scaling.
+- We continue using step-based scheduling (rather than epoch-based scheduling).
+- We use mean reduction for our loss. As a result, we don't scale down our learning rate.
 """
 
 # %% 1. Global Constants
@@ -86,18 +83,14 @@ class Config:
     batch_size: int = 768
     momentum: float = 0.9
     "SGD momentum (not BatchNorm momentum)."
-    nesterov: bool = False
+    nesterov: bool = True
     "Whether to use Nesterov momentum (SGD only)."
-    beta_2: float = 0.999
-    "AdamW beta_2."
     weight_decay: float = 0.01
     "Weight decay."
-    max_lr: float = 3e-2
+    max_lr: float = 4e-2
     "Our maximum learning rate."
-    warmup_steps: int = 300
+    warmup_steps: int = 450
     "The number of steps over which we linearly increase the learning rate from 0 to max_lr."
-    optimizer: Literal['sgd', 'adamw'] = 'sgd'
-    "The optimizer to use."
     
     # --- Data Augmentation --- #
     flip: bool = True
@@ -341,25 +334,14 @@ class BackboneTrainer:
             memory_format=torch.channels_last
         )
 
-        if cfg.optimizer == 'sgd':
-            self.opt = torch.optim.SGD(
-                self.model.parameters(),
-                lr=self.cfg.max_lr,
-                momentum=cfg.momentum,
-                weight_decay=cfg.weight_decay,
-                nesterov=cfg.nesterov,
-                fused=True,
-            )
-        elif cfg.optimizer == 'adamw':
-            self.opt = torch.optim.AdamW(
-                self.model.parameters(),
-                betas=(cfg.momentum, cfg.beta_2),
-                lr=self.cfg.max_lr,
-                weight_decay=cfg.weight_decay,
-                fused=True,
-            )
-        else:
-            raise ValueError(f"Invalid optimizer: {cfg.optimizer}")
+        self.opt = torch.optim.SGD(
+            self.model.parameters(),
+            lr=self.cfg.max_lr,
+            momentum=cfg.momentum,
+            weight_decay=cfg.weight_decay,
+            nesterov=cfg.nesterov,
+            fused=True,
+        )
         
         warmup = torch.optim.lr_scheduler.LinearLR(
             self.opt,
@@ -551,7 +533,6 @@ if __name__ == "__main__":
                 "dtype": {"values": ["fp16", "bf16"]},
                 "fc_scale": {"min": 0.03, "max": 1.0, "distribution": "log_uniform_values"},
 
-                "optimizer": {"values": ["sgd", "adamw"]},
                 "max_lr": {"min": 1e-4, "max": 0.5, "distribution": "log_uniform_values"},
                 "warmup_steps": {"min": 0, "max": 600, "distribution": "int_uniform"},
 
