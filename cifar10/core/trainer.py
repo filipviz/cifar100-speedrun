@@ -1,17 +1,218 @@
-import torch
+import logging
+import os
+import subprocess
+import sys
+import time
 from dataclasses import dataclass, field
+from typing import Literal, Iterable
+
+from tabulate import tabulate
+import torch
+import torch.nn.functional as F
+from torch import nn, optim, Tensor
+from tqdm import tqdm
+import wandb
+
+from .config import ExperimentCfg, SharedCfg
+
+LOGGING_COLUMNS = ['step', 'time', 'interval', 'lr', 'train_loss', 'train_acc1',
+                   'train_acc5', 'test_loss', 'test_acc1', 'test_acc5']
+HEADER_FMT = "|{:^6s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|"
+ROW_FMT = "|{:>6d}|{:>10,.3f}|{:>10,.3f}|{:>10,.3e}|{:>10,.3f}|{:>10.3%}|{:>10.3%}|{:>10,.3f}|{:>10.3%}|{:>10.3%}|"
+
+def setup_logging(log_dir: str, cfg: ExperimentCfg):
+    """Call before initializing a Trainer."""
+    os.makedirs(log_dir, exist_ok=True)
+    logging.basicConfig(filename=f"{log_dir}/{cfg.shared.run_id}.txt", format="%(message)s", level=logging.INFO)
+    logging.info(" ".join(sys.argv))
+    logging.info(f"Run ID: {cfg.shared.run_id}")
+    logging.info(f"Running Python {sys.version} and PyTorch {torch.version.__version__}")
+    logging.info(f"Running CUDA {torch.version.cuda} and cuDNN {torch.backends.cudnn.version()}")
+    logging.info(torch.cuda.get_device_name())
+    logging.info(tabulate(vars(cfg).items(), headers=["Config Field", "Value"]))
+
+def finish_logging():
+    """Call after training is complete."""
+    try:
+        smi = subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        logging.info(smi.stdout)
+    except Exception as e:
+        logging.info(f"Error running nvidia-smi: {e}")
+
+    logging.info(f"Max memory allocated: {torch.cuda.max_memory_allocated() // 1024**2:,} MiB")
+    logging.info(f"Max memory reserved: {torch.cuda.max_memory_reserved() // 1024**2:,} MiB")
+    
+    # Write entry point source to our logs.
+    with open(sys.argv[0]) as f:
+        logging.info(f.read())
 
 @dataclass
 class TrainerCfg:
-    ...
+    # --- Training --- #
+    train_steps: int = 1_500
+    "Number of mini-batch iterations we train for."
+    eval_every: int = 100
+    "Set to 0 to disable evaluation."
+    save_every: int = 0
+    "Set to 0 to disable checkpointing. Must be a multiple of eval_every."
+    
+    disable_logging: bool = False
+
+    # --- Wandb --- #
+    use_wandb: bool = True
+    wandb_project: str = "cifar10"
+    wandb_note: str = ""
+    sweep_count: int = 0
+    "Number of sweeps to run. Set to 0 to disable sweeps."
+
+    def __post_init__(self):
+        if self.eval_every > 0:
+            assert self.save_every % self.eval_every == 0, "save_every must be a multiple of eval_every"
+        if self.use_wandb:
+            assert self.wandb_project, "Must specify a wandb_project"
 
 class Trainer:
-    def __init__(self, cfg: TrainerCfg):
-        pass
-    
+    def __init__(
+        self,
+        cfg: TrainerCfg,
+        shared_cfg: SharedCfg,
+        train_loader: Iterable[tuple[Tensor, Tensor]],
+        test_loader: Iterable[tuple[Tensor, Tensor]],
+        make_optimizer: callable[[nn.Module], optim.Optimizer],
+        make_scheduler: callable[[optim.Optimizer], optim.lr_scheduler.LRScheduler],
+        model: nn.Module,
+    ):
+        logging_is_configured = logging.getLogger().hasHandlers()
+        assert logging_is_configured, "Logging must be configured before a Trainer is instantiated. Call setup_logging."
+
+        self.cfg = cfg
+        self.run_id, self.device = shared_cfg.run_id, shared_cfg.device
+        self.dtype = {
+            'fp16': torch.float16,
+            'bf16': torch.bfloat16,
+            'fp32': torch.float32,
+        }[shared_cfg.dtype]
+        
+        self.train_loader, self.test_loader = train_loader, test_loader
+        self.model = model.to(
+            device=self.device,
+            memory_format=torch.channels_last
+        )
+
+        self.opt = make_optimizer(self.model)
+        self.scheduler = make_scheduler(self.opt)
+        
+        if self.cfg.save_every > 0:
+            self.checkpoint_dir = f"{shared_cfg.base_dir}/checkpoints"
+            os.makedirs(self.checkpoint_dir, exist_ok=True)
+
     def train(self):
-        pass
+        logging.info(HEADER_FMT.format(*LOGGING_COLUMNS))
+        logging.info(HEADER_FMT.format(*['---' for _ in LOGGING_COLUMNS]))
+
+        self.model.train()
+        loader_iter = iter(self.train_loader)
+        pbar = tqdm(range(1, self.cfg.train_steps+1), desc="Training")
+        training_time = 0.0
+        
+        # Start the clock.
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        
+        scaler = torch.GradScaler(enabled=(self.dtype == torch.float16))
+        for step in pbar:
+            # ---- Training ---- #
+
+            # 1. Load our batch and labels.
+            batch, labels = next(loader_iter)
+
+            # 2. Forward pass.
+            with torch.autocast(self.device, dtype=self.dtype):
+                pred = self.model(batch)
+                loss = F.cross_entropy(pred, labels)
+
+            # 3. Backward pass.
+            self.opt.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            scaler.step(self.opt)
+            scaler.update()
+
+            # 4. Update our learning rate.
+            self.scheduler.step()
+            
+            if self.cfg.use_wandb:
+                wandb.log({
+                    'train_loss': loss.item(),
+                    'lr': self.scheduler.get_last_lr()[0],
+                }, step)
+
+            # ---- Evaluation ---- #
+            last_step = step == self.cfg.train_steps
+            if last_step or self.cfg.eval_every > 0 and step % self.cfg.eval_every == 0:
+                torch.cuda.synchronize()
+                interval_time = time.perf_counter() - t0
+                training_time += interval_time
+                
+                # Save a checkpoint.
+                if self.cfg.save_every > 0 and (
+                    last_step or step % self.cfg.save_every == 0
+                ):
+                    torch.save({
+                        'model': self.model.state_dict(),
+                        'optimizer': self.opt.state_dict(),
+                        'step': step,
+                    }, f"{self.checkpoint_dir}/{self.run_id}-step-{step}.pt")
+                
+                self.model.eval()
+                test_metrics = self.evaluate()
+                self.model.train()
+                
+                # Our trainining metrics are only estimates (computed on a single batch).
+                metrics = {
+                    "step": step, 
+                    "time": training_time,
+                    "interval": interval_time,
+                    "lr": self.opt.param_groups[0]['lr'],
+                    "train_loss": loss.item(),
+                    "train_acc1": (pred.argmax(dim=1) == labels).float().mean().item(),
+                    "train_acc5": (pred.topk(5)[1] == labels.view(-1, 1)).any(dim=1).float().mean().item(),
+                    **test_metrics,
+                }
+                logging.info(ROW_FMT.format(*[metrics[col] for col in LOGGING_COLUMNS]))
+                pbar.set_postfix(train_loss=metrics['train_loss'], test_loss=metrics['test_loss'])
+
+                if self.cfg.use_wandb:
+                    del metrics['step']
+                    wandb.log(metrics, step)
+                
+                # Start the clock again.
+                torch.cuda.synchronize()
+                t0 = time.perf_counter()
+
+        torch.cuda.synchronize()
+        training_time += time.perf_counter() - t0
+        logging.info(f"Total training time: {training_time:,.2f}s")
     
     @torch.inference_mode()
-    def evaluate(self):
-        pass
+    def evaluate(self) -> dict[str, float]:
+        assert not self.model.training, "Model must be in eval mode"
+        items = self.test_loader.n_images
+        cum_loss = torch.tensor(0.0, device=self.device)
+        n_correct_top1 = torch.tensor(0.0, device=self.device)
+        n_correct_top5 = torch.tensor(0.0, device=self.device)
+
+        pbar = tqdm(self.test_loader, desc="Evaluating", position=1, leave=False)
+        for batch, labels in pbar:
+            with torch.autocast(self.device, dtype=self.dtype):
+                pred = self.model(batch)
+                loss = F.cross_entropy(pred, labels, reduction="sum")
+
+            cum_loss += loss
+            n_correct_top1 += (pred.argmax(dim=1) == labels).sum()
+            n_correct_top5 += (pred.topk(5)[1] == labels.view(-1, 1)).sum()
+            
+        return {
+            "test_loss": cum_loss.item() / items,
+            "test_acc1": n_correct_top1.item() / items,
+            "test_acc5": n_correct_top5.item() / items,
+        }
