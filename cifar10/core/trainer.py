@@ -20,16 +20,18 @@ LOGGING_COLUMNS = ['step', 'time', 'interval', 'lr', 'train_loss', 'train_acc1',
 HEADER_FMT = "|{:^6s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|"
 ROW_FMT = "|{:>6d}|{:>10,.3f}|{:>10,.3f}|{:>10,.3e}|{:>10,.3f}|{:>10.3%}|{:>10.3%}|{:>10,.3f}|{:>10.3%}|{:>10.3%}|"
 
-def setup_logging(log_dir: str, cfg: ExperimentCfg):
+def setup_logging(log_dir: str, cfg: ExperimentCfg, model_cfg: dataclass):
     """Call before initializing a Trainer."""
     os.makedirs(log_dir, exist_ok=True)
     logging.basicConfig(filename=f"{log_dir}/{cfg.shared.run_id}.txt", format="%(message)s", level=logging.INFO)
     logging.info(" ".join(sys.argv))
     logging.info(f"Run ID: {cfg.shared.run_id}")
-    logging.info(f"Running Python {sys.version} and PyTorch {torch.version.__version__}")
+    logging.info(f"Running Python {sys.version} and PyTorch {torch.__version__}")
     logging.info(f"Running CUDA {torch.version.cuda} and cuDNN {torch.backends.cudnn.version()}")
     logging.info(torch.cuda.get_device_name())
     logging.info(tabulate(vars(cfg).items(), headers=["Config Field", "Value"]))
+    logging.info(f"Model class: {model_cfg.__class__.__name__}")
+    logging.info(tabulate(vars(model_cfg).items(), headers=["Config Field", "Value"]))
 
 def finish_logging():
     """Call after training is complete."""
@@ -172,7 +174,7 @@ class Trainer:
                     "step": step, 
                     "time": training_time,
                     "interval": interval_time,
-                    "lr": self.opt.param_groups[0]['lr'],
+                    "lr": self.scheduler.get_last_lr()[0],
                     "train_loss": loss.item(),
                     "train_acc1": (pred.argmax(dim=1) == labels).float().mean().item(),
                     "train_acc5": (pred.topk(5)[1] == labels.view(-1, 1)).any(dim=1).float().mean().item(),

@@ -68,7 +68,11 @@ class GPULoader:
         return (self.n_images + self.batch_size - 1) // self.batch_size
     
     def __iter__(self):
-        indices = torch.randperm(self.n_images, device=self.device)
+        if self.train:
+            indices = torch.randperm(self.n_images, device=self.device)
+        else:
+            indices = torch.arange(self.n_images, device=self.device)
+
         position = 0
         loop = True
 

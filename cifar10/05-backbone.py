@@ -5,9 +5,9 @@ from torch import nn, Tensor, optim
 import torch.nn.functional as F
 from jaxtyping import Float
 
-from cifar10.core.config import ExperimentCfg, SharedCfg
-from cifar10.core.gpuloader import GPULoader, GPULoaderCfg
-from cifar10.core.trainer import Trainer, TrainerCfg, finish_logging, setup_logging
+from core.config import ExperimentCfg
+from core.gpuloader import GPULoader, GPULoaderCfg
+from core.trainer import Trainer, TrainerCfg, finish_logging, setup_logging
 
 # %% [markdown]
 """
@@ -27,7 +27,7 @@ In [part 4](https://web.archive.org/web/20231108123408/https://myrtle.ai/learn/h
     - Replacing the concatenated max/average pooling layer with max pooling. To compensate for the reduced input for the final linear layer, he doubles the output size of the final convolution.
     - Using unit initialization for the BatchNorm scale weights (gamma). The PyTorch 0.4 default was random uniform initialization over [0, 1].
     - Scaling the final classifier layer by 0.125.
-- He then applies brute force architecture search, finding that adding residual blocks (consisting of two 3x3 convolutions -> batchnorm -> ReLU sequences with identity shortcuts) after the pooling in the first and third layers performs well. With this architecture he achieves 94.08% accuracy in 79s!
+- He then applies brute force architecture search, finding that adding residual blocks (consisting of two 3x3 convolutions -> batchnorm -> ReLU sequences with identity shortcuts) after the pooling in the first and third layers performs well. With this architecture he achieves 94.08% accuracy in 79s (24 epochs)!
 
 In our implementation:
 - We're using autocast and grad scaling.
@@ -129,7 +129,7 @@ if __name__ == "__main__":
     assert torch.cuda.is_available(), "This script requires a CUDA-enabled GPU."
     
     batch_size = 768
-    steps_per_epoch = (50_000 + batch_size - 1) // batch_size
+    steps_per_epoch = 50_000 // batch_size
     warmup_steps = steps_per_epoch * 5
     train_steps = steps_per_epoch * 24
     
@@ -165,9 +165,10 @@ if __name__ == "__main__":
             optimizer, schedulers=[warmup, decay], milestones=[warmup_steps]
         )
         
-    model = BackboneResnet(BackboneCfg())
-    setup_logging(f"{cfg.shared.base_dir}/logs", cfg)
+    model_cfg = BackboneCfg()
+    model = BackboneResnet(model_cfg)
+
+    setup_logging(f"{cfg.shared.base_dir}/logs", cfg, model_cfg)
     trainer = Trainer(cfg.trainer, cfg.shared, train_loader, test_loader, make_optimizer, make_scheduler, model)
     trainer.train()
     finish_logging()
-# %%
