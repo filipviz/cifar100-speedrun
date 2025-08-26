@@ -8,21 +8,8 @@ from torchvision.datasets import CIFAR10
 import torch.nn.functional as F
 from einops import rearrange
 
-from .config import SharedCfg
+from .config import GPULoaderCfg, SharedCfg
 
-@dataclass
-class GPULoaderCfg:
-    batch_size: int = 768
-
-    # --- Data Augmentation --- #
-    normalize: bool = True
-    flip: bool = True
-    "Random horizontal flipping."
-    pad_mode: Literal['reflect', 'constant'] = 'reflect'
-    crop_padding: int = 4
-    "Set to 0 to disable padding and random cropping."
-    cutout_size: int = 8
-    "Set to 0 to disable cutout."
     
 
 class GPULoader:
@@ -61,25 +48,30 @@ class GPULoader:
         self.images = rearrange(self.images, "b h w c -> b c h w").to(memory_format=torch.channels_last)
         
         self.n_images = len(self.images)
+        assert self.batch_size <= 2 * self.n_images, "To support this batch size you have to update __iter__"
     
     def __len__(self):
         # Needed for tqdm to work when self.train=False.
         # math.ceil(self.n_images / self.batch_size)
+        assert not self.train, "__len__ is not defined for a GPULoader with train=True"
         return (self.n_images + self.batch_size - 1) // self.batch_size
     
     def __iter__(self):
-        if self.train:
-            indices = torch.randperm(self.n_images, device=self.device)
-        else:
-            indices = torch.arange(self.n_images, device=self.device)
-
         position = 0
-        loop = True
+        if not self.train:
+            while position < self.n_images:
+                next_position = position + self.batch_size
+                images = self.images[position:next_position]
+                labels = self.labels[position:next_position]
+                position = next_position
+                yield images, labels
+            return
 
-        while loop:
+        indices = torch.randperm(self.n_images, device=self.device)
+        while True:
             last_batch = position + self.batch_size > self.n_images
             # If we need to wrap around, we combine remaining indices with indices from the new epoch.
-            if last_batch and self.train:
+            if last_batch:
                 remaining = indices[position:]
                 indices = torch.randperm(self.n_images, device=self.device)
                 needed = self.batch_size - len(remaining)
@@ -89,19 +81,16 @@ class GPULoader:
                 # Otherwise, we take the next batch of indices from the current epoch.
                 batch_indices = indices[position:position + self.batch_size]
                 position += self.batch_size
-                if last_batch and not self.train:
-                    loop = False
             
             images = self.images[batch_indices]
             labels = self.labels[batch_indices]
             
-            if self.train:
-                if self.cfg.crop_padding > 0:
-                    images = batch_crop(images, crop_size=32)
-                if self.cfg.flip:
-                    images = batch_flip_lr(images)
-                if self.cfg.cutout_size > 0:
-                    images = batch_cutout(images, size=self.cfg.cutout_size)
+            if self.cfg.crop_padding > 0:
+                images = batch_crop(images, crop_size=32)
+            if self.cfg.flip:
+                images = batch_flip_lr(images)
+            if self.cfg.cutout_size > 0:
+                images = batch_cutout(images, size=self.cfg.cutout_size)
 
             yield images, labels
 

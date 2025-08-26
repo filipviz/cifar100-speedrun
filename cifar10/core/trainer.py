@@ -3,8 +3,8 @@ import os
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, field
-from typing import Literal, Iterable
+from dataclasses import dataclass
+from typing import Iterable, Callable
 
 from tabulate import tabulate
 import torch
@@ -13,65 +13,8 @@ from torch import nn, optim, Tensor
 from tqdm import tqdm
 import wandb
 
-from .config import ExperimentCfg, SharedCfg
+from .config import ExperimentCfg, SharedCfg, TrainerCfg
 
-LOGGING_COLUMNS = ['step', 'time', 'interval', 'lr', 'train_loss', 'train_acc1',
-                   'train_acc5', 'test_loss', 'test_acc1', 'test_acc5']
-HEADER_FMT = "|{:^6s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|"
-ROW_FMT = "|{:>6d}|{:>10,.3f}|{:>10,.3f}|{:>10,.3e}|{:>10,.3f}|{:>10.3%}|{:>10.3%}|{:>10,.3f}|{:>10.3%}|{:>10.3%}|"
-
-def setup_logging(log_dir: str, cfg: ExperimentCfg, model_cfg: dataclass):
-    """Call before initializing a Trainer."""
-    os.makedirs(log_dir, exist_ok=True)
-    logging.basicConfig(filename=f"{log_dir}/{cfg.shared.run_id}.txt", format="%(message)s", level=logging.INFO)
-    logging.info(" ".join(sys.argv))
-    logging.info(f"Run ID: {cfg.shared.run_id}")
-    logging.info(f"Running Python {sys.version} and PyTorch {torch.__version__}")
-    logging.info(f"Running CUDA {torch.version.cuda} and cuDNN {torch.backends.cudnn.version()}")
-    logging.info(torch.cuda.get_device_name())
-    logging.info(tabulate(vars(cfg).items(), headers=["Config Field", "Value"]))
-    logging.info(f"Model class: {model_cfg.__class__.__name__}")
-    logging.info(tabulate(vars(model_cfg).items(), headers=["Config Field", "Value"]))
-
-def finish_logging():
-    """Call after training is complete."""
-    try:
-        smi = subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        logging.info(smi.stdout)
-    except Exception as e:
-        logging.info(f"Error running nvidia-smi: {e}")
-
-    logging.info(f"Max memory allocated: {torch.cuda.max_memory_allocated() // 1024**2:,} MiB")
-    logging.info(f"Max memory reserved: {torch.cuda.max_memory_reserved() // 1024**2:,} MiB")
-    
-    # Write entry point source to our logs.
-    with open(sys.argv[0]) as f:
-        logging.info(f.read())
-
-@dataclass
-class TrainerCfg:
-    # --- Training --- #
-    train_steps: int = 1_500
-    "Number of mini-batch iterations we train for."
-    eval_every: int = 100
-    "Set to 0 to disable evaluation."
-    save_every: int = 0
-    "Set to 0 to disable checkpointing. Must be a multiple of eval_every."
-    
-    disable_logging: bool = False
-
-    # --- Wandb --- #
-    use_wandb: bool = True
-    wandb_project: str = "cifar10"
-    wandb_note: str = ""
-    sweep_count: int = 0
-    "Number of sweeps to run. Set to 0 to disable sweeps."
-
-    def __post_init__(self):
-        if self.eval_every > 0:
-            assert self.save_every % self.eval_every == 0, "save_every must be a multiple of eval_every"
-        if self.use_wandb:
-            assert self.wandb_project, "Must specify a wandb_project"
 
 class Trainer:
     def __init__(
@@ -80,8 +23,8 @@ class Trainer:
         shared_cfg: SharedCfg,
         train_loader: Iterable[tuple[Tensor, Tensor]],
         test_loader: Iterable[tuple[Tensor, Tensor]],
-        make_optimizer: callable[[nn.Module], optim.Optimizer],
-        make_scheduler: callable[[optim.Optimizer], optim.lr_scheduler.LRScheduler],
+        make_optimizer: Callable[[nn.Module], optim.Optimizer],
+        make_scheduler: Callable[[optim.Optimizer], optim.lr_scheduler.LRScheduler],
         model: nn.Module,
     ):
         logging_is_configured = logging.getLogger().hasHandlers()
@@ -218,3 +161,39 @@ class Trainer:
             "test_acc1": n_correct_top1.item() / items,
             "test_acc5": n_correct_top5.item() / items,
         }
+
+# --- Logging Utilities --- #
+# Call setup_logging before initializing a Trainer, and finish_logging after training is complete.
+
+LOGGING_COLUMNS = ['step', 'time', 'interval', 'lr', 'train_loss', 'train_acc1',
+                   'train_acc5', 'test_loss', 'test_acc1', 'test_acc5']
+HEADER_FMT = "|{:^6s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|"
+ROW_FMT = "|{:>6d}|{:>10,.3f}|{:>10,.3f}|{:>10,.3e}|{:>10,.3f}|{:>10.3%}|{:>10.3%}|{:>10,.3f}|{:>10.3%}|{:>10.3%}|"
+
+def setup_logging(log_dir: str, cfg: ExperimentCfg, model_cfg: dataclass):
+    """Call before initializing a Trainer."""
+    os.makedirs(log_dir, exist_ok=True)
+    logging.basicConfig(filename=f"{log_dir}/{cfg.shared.run_id}.txt", format="%(message)s", level=logging.INFO)
+    logging.info(" ".join(sys.argv))
+    logging.info(f"Run ID: {cfg.shared.run_id}")
+    logging.info(f"Running Python {sys.version} and PyTorch {torch.__version__}")
+    logging.info(f"Running CUDA {torch.version.cuda} and cuDNN {torch.backends.cudnn.version()}")
+    logging.info(torch.cuda.get_device_name())
+    logging.info(tabulate(vars(cfg).items(), headers=["Config Field", "Value"]))
+    logging.info(f"Model class: {model_cfg.__class__.__name__}")
+    logging.info(tabulate(vars(model_cfg).items(), headers=["Config Field", "Value"]))
+
+def finish_logging():
+    """Call after training is complete."""
+    try:
+        smi = subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        logging.info(smi.stdout)
+    except Exception as e:
+        logging.info(f"Error running nvidia-smi: {e}")
+
+    logging.info(f"Max memory allocated: {torch.cuda.max_memory_allocated() // 1024**2:,} MiB")
+    logging.info(f"Max memory reserved: {torch.cuda.max_memory_reserved() // 1024**2:,} MiB")
+    
+    # Write entry point source to our logs.
+    with open(sys.argv[0]) as f:
+        logging.info(f.read())

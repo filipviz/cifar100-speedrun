@@ -4,9 +4,6 @@ import os
 from typing import Literal
 
 import torch
-from .gpuloader import GPULoaderCfg
-from .torchloader import TorchLoaderCfg
-from .trainer import TrainerCfg
 
 @dataclass
 class SharedCfg:
@@ -15,6 +12,70 @@ class SharedCfg:
     dtype: Literal['fp16', 'bf16', 'fp32'] = 'fp16'
     base_dir: str = os.getcwd()
     run_id: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
+
+
+@dataclass
+class TrainerCfg:
+    # --- Training --- #
+    train_steps: int = 1_500
+    "Number of mini-batch iterations we train for."
+    eval_every: int = 100
+    "Set to 0 to disable evaluation."
+    save_every: int = 0
+    "Set to 0 to disable checkpointing. Must be a multiple of eval_every."
+    
+    disable_logging: bool = False
+
+    # --- Wandb --- #
+    use_wandb: bool = False
+    wandb_project: str = "cifar10"
+    wandb_note: str = ""
+    sweep_count: int = 0
+    "Number of sweeps to run. Set to 0 to disable sweeps."
+
+    def __post_init__(self):
+        if self.eval_every > 0:
+            assert self.save_every % self.eval_every == 0, "save_every must be a multiple of eval_every"
+        if self.use_wandb:
+            assert self.wandb_project, "Must specify a wandb_project"
+
+
+@dataclass
+class GPULoaderCfg:
+    batch_size: int = 768
+
+    # --- Data Augmentation --- #
+    normalize: bool = True
+    flip: bool = True
+    "Random horizontal flipping."
+    pad_mode: Literal['reflect', 'constant'] = 'reflect'
+    crop_padding: int = 4
+    "Set to 0 to disable padding and random cropping."
+    cutout_size: int = 8
+    "Set to 0 to disable cutout."
+
+@dataclass
+class TorchLoaderCfg:
+    batch_size: int = 768
+    n_workers: int = 12
+
+    # --- Data Augmentation --- #
+    normalize_he: bool = True
+    "Normalize with the per-pixel mean and without std, as in He et al 2015."
+    normalize_torch: bool = False
+    "Normalize with the per-channel mean and std, using torchvision's v2.Normalize."
+    flip: bool = True
+    "Random horizontal flipping."
+    pad_mode: Literal['reflect', 'constant'] = 'reflect'
+    crop_padding: int = 4
+    "Set to 0 to disable padding and random cropping."
+    cutout_size: int = 8
+    "Set to 0 to disable cutout."
+    
+    def __post_init__(self):
+        assert not (self.normalize_he and self.normalize_torch), "Cannot normalize with both methods"
+
+
 
 @dataclass
 class ExperimentCfg:
