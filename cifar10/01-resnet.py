@@ -1,3 +1,4 @@
+# %%
 from dataclasses import dataclass, field
 
 import torch
@@ -5,9 +6,9 @@ from torch import nn, Tensor, optim
 import torch.nn.functional as F
 from jaxtyping import Float
 
-from cifar10.core.config import ExperimentCfg, SharedCfg, TorchLoaderCfg, TrainerCfg
-from cifar10.core.torchloader import TorchLoader
-from cifar10.core.trainer import Trainer, finish_logging, setup_logging
+from core.config import ExperimentCfg, SharedCfg, TorchLoaderCfg, TrainerCfg
+from core.torchloader import TorchLoader
+from core.trainer import Trainer, finish_logging, setup_logging
 
 # %% [markdown]
 """
@@ -158,12 +159,6 @@ if __name__ == "__main__":
         trainer=TrainerCfg(
             train_steps=64_000,
             eval_every=4_000,
-        ),
-        loader=TorchLoaderCfg(
-            batch_size=128,
-            n_workers=12,
-            cutout_size=0,
-            pad_mode='constant',
         ),
         allow_tf32=False,
         float32_matmul_precision='highest',

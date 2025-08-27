@@ -37,7 +37,8 @@ class Trainer:
             'bf16': torch.bfloat16,
             'fp32': torch.float32,
         }[shared_cfg.dtype]
-
+        
+        self.autocast_enabled = self.dtype != torch.float32
         self.train_loader, self.test_loader = train_loader, test_loader
         self.model = model.to(
             device=self.device,
@@ -48,7 +49,7 @@ class Trainer:
         self.scheduler = make_scheduler(self.opt)
 
         if self.cfg.save_every > 0:
-            self.checkpoint_dir = f"{shared_cfg.base_dir}/checkpoints"
+            self.checkpoint_dir = os.path.join(shared_cfg.base_dir, "checkpoints")
             os.makedirs(self.checkpoint_dir, exist_ok=True)
 
     def train(self):
@@ -72,9 +73,9 @@ class Trainer:
             batch, labels = next(loader_iter)
 
             # 2. Forward pass.
-            with torch.autocast(self.device, dtype=self.dtype):
+            with torch.autocast(self.device, dtype=self.dtype, enabled=self.autocast_enabled):
                 pred = self.model(batch)
-                loss = F.cross_entropy(pred, labels)
+                loss = F.cross_entropy(pred, labels, label_smoothing=self.cfg.label_smoothing)
 
             # 3. Backward pass.
             self.opt.zero_grad(set_to_none=True)
@@ -106,7 +107,7 @@ class Trainer:
                         'model': self.model.state_dict(),
                         'optimizer': self.opt.state_dict(),
                         'step': step,
-                    }, f"{self.checkpoint_dir}/{self.run_id}-step-{step}.pt")
+                    }, os.path.join(self.checkpoint_dir, f"{self.run_id}-step-{step}.pt"))
 
                 self.model.eval()
                 test_metrics = self.evaluate()
@@ -148,7 +149,7 @@ class Trainer:
 
         pbar = tqdm(self.test_loader, desc="Evaluating", position=1, leave=False)
         for batch, labels in pbar:
-            with torch.autocast(self.device, dtype=self.dtype):
+            with torch.autocast(self.device, dtype=self.dtype, enabled=self.autocast_enabled):
                 pred = self.model(batch)
                 loss = F.cross_entropy(pred, labels, reduction="sum")
 
@@ -184,7 +185,7 @@ def setup_logging(cfg: ExperimentCfg, model_cfg: dataclass):
     logging.info(f"Running CUDA {torch.version.cuda} and cuDNN {torch.backends.cudnn.version()}")
     logging.info(torch.cuda.get_device_name())
     logging.info(tabulate(vars(cfg).items(), headers=["Config Field", "Value"]))
-    logging.info(f"Model class: {model_cfg.__class__.__name__}")
+    logging.info(f"Config class: {model_cfg.__class__.__name__}")
     logging.info(tabulate(vars(model_cfg).items(), headers=["Config Field", "Value"]))
 
 def finish_logging():

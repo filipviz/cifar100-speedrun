@@ -1,3 +1,4 @@
+# %%
 from dataclasses import dataclass, field
 
 import torch
@@ -137,7 +138,6 @@ if __name__ == "__main__":
             train_steps=train_steps,
             eval_every=steps_per_epoch,
         ),
-        loader=GPULoaderCfg(batch_size=batch_size),
     )
 
     train_loader = GPULoader(True, cfg.loader, cfg.shared)

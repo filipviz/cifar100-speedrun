@@ -23,8 +23,9 @@ class TrainerCfg:
     "Set to 0 to disable evaluation."
     save_every: int = 0
     "Set to 0 to disable checkpointing. Must be a multiple of eval_every."
-
-    disable_logging: bool = False
+    
+    label_smoothing: float = 0.0
+    "Label smoothing epsilon. Set to 0 to disable."
 
     # --- Wandb --- #
     use_wandb: bool = False
@@ -56,7 +57,7 @@ class GPULoaderCfg:
 
 @dataclass
 class TorchLoaderCfg:
-    batch_size: int = 768
+    batch_size: int = 128
     n_workers: int = 12
 
     # --- Data Augmentation --- #
@@ -66,10 +67,10 @@ class TorchLoaderCfg:
     "Normalize with the per-channel mean and std, using torchvision's v2.Normalize."
     flip: bool = True
     "Random horizontal flipping."
-    pad_mode: Literal['reflect', 'constant'] = 'reflect'
+    pad_mode: Literal['reflect', 'constant'] = 'constant'
     crop_padding: int = 4
     "Set to 0 to disable padding and random cropping."
-    cutout_size: int = 8
+    cutout_size: int = 0
     "Set to 0 to disable cutout."
 
     def __post_init__(self):

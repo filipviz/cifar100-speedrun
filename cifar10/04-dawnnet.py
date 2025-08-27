@@ -7,9 +7,9 @@ import torch.nn.functional as F
 import numpy as np
 from jaxtyping import Float
 
-from cifar10.core.config import ExperimentCfg, GPULoaderCfg, TrainerCfg
-from cifar10.core.gpuloader import GPULoader
-from cifar10.core.trainer import Trainer, finish_logging, setup_logging
+from core.config import ExperimentCfg, GPULoaderCfg, TrainerCfg
+from core.gpuloader import GPULoader
+from core.trainer import Trainer, finish_logging, setup_logging
 
 # %% [markdown]
 """
