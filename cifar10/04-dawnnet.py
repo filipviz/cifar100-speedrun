@@ -43,8 +43,9 @@ Also see Page's [implementation notebook](https://github.com/davidcpage/cifar10-
 
 Our implementation departs from his in a few ways:
 1. We use step-based (rather than epoch-based) scheduling.
-2. Oddly, he applies the first batchnorm + ReLU to both the residual stream and the convolution path (which hurts performance). It doesn't make a huge difference for a network this shallow, but I won't do this.
-3. We take a more aggressive approach to data loading by loading the entire dataset into GPU memory (in uint8) and applying pre-processing on-device during the first call to `__iter__`. Tracing suggests we're only spending 4ms per epoch generating randperm indices and 29µs generating random numbers per batch. This comes out to about 0.24 seconds across the entire training run, so I don't think it's worth optimizing further yet.
+2. Since our trainer uses mean loss reduction, we don't divide the learning rate by the batch size or multiply the weight decay by the batch size.
+3. Oddly, he applies the first batchnorm + ReLU to both the residual stream and the convolution path (which hurts performance). It doesn't make a huge difference for a network this shallow, but I won't do this.
+4. We take a more aggressive approach to data loading by loading the entire dataset into GPU memory (in uint8) and applying pre-processing on-device during the first call to `__iter__`. Tracing suggests we're only spending 4ms per epoch generating randperm indices and 29µs generating random numbers per batch. This comes out to about 0.24 seconds across the entire training run, so I don't think it's worth optimizing further yet.
 """
 
 # %% 1. Model Hyperparameters

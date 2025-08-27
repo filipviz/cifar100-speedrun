@@ -128,7 +128,7 @@ class BackboneResnet(nn.Module):
 if __name__ == "__main__":
     assert torch.cuda.is_available(), "This script requires a CUDA-enabled GPU."
 
-    batch_size = 768
+    batch_size = 512
     steps_per_epoch = 50_000 // batch_size
     warmup_steps = steps_per_epoch * 5
     train_steps = steps_per_epoch * 24
@@ -137,6 +137,9 @@ if __name__ == "__main__":
         trainer=TrainerCfg(
             train_steps=train_steps,
             eval_every=steps_per_epoch,
+        ),
+        loader=GPULoaderCfg(
+            batch_size=batch_size,
         ),
     )
 
@@ -148,16 +151,16 @@ if __name__ == "__main__":
             model.parameters(),
             lr=0.4,
             momentum=0.9,
-            weight_decay=0.01,
+            weight_decay=5e-4,
             nesterov=True,
         )
 
     def make_scheduler(optimizer: optim.Optimizer) -> optim.lr_scheduler.LRScheduler:
         warmup = optim.lr_scheduler.LinearLR(
-            optimizer, start_factor=1e-3, end_factor=1.0, total_iters=warmup_steps
+            optimizer, start_factor=1e-8, end_factor=1.0, total_iters=warmup_steps
         )
         decay = optim.lr_scheduler.LinearLR(
-            optimizer, start_factor=1.0, end_factor=1e-3, total_iters=train_steps - warmup_steps
+            optimizer, start_factor=1.0, end_factor=0.0, total_iters=train_steps - warmup_steps
         )
 
         return optim.lr_scheduler.SequentialLR(

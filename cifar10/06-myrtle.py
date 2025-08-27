@@ -136,7 +136,7 @@ if __name__ == "__main__":
             model.parameters(),
             lr=0.4,
             momentum=0.9,
-            weight_decay=0.01,
+            weight_decay=5e-4,
             nesterov=True,
         )
 
