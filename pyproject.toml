@@ -17,3 +17,9 @@ dependencies = [
     "tqdm>=4.67.1",
     "wandb>=0.21.0",
 ]
+
+[tool.ruff.lint]
+select = ["F", "E1", "E9", "W", "RUF100", "B007", "B023", "BLE001"]
+ignore = ["W605", "F722"]
+preview = true
+extend-select = ["W391"]

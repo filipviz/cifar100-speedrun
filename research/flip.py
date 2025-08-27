@@ -5,7 +5,6 @@ from torch import Tensor
 from jaxtyping import Float
 from torchvision.datasets import CIFAR100
 from einops import rearrange
-import torch.nn.functional as F
 from torch.utils import benchmark
 
 # %%
@@ -25,19 +24,19 @@ def batch_flip_gather(images: Float[Tensor, "b c h w"]) -> Float[Tensor, "b c h 
     flip_mask = torch.rand(b, device=images.device) < 0.5
     ws = torch.arange(w, device=images.device)
     ws_flipped = ws.flip(0)
-    
+
     indices = torch.where(
-        flip_mask.view(-1, 1), 
-        ws_flipped, 
+        flip_mask.view(-1, 1),
+        ws_flipped,
         ws
     )
-    
+
     # Expand indices for all batch items
     indices = indices.view(b, 1, 1, w).expand(-1, c, h, -1)
-    
+
     return images.gather(-1, indices)
 
-# %% 
+# %%
 
 if __name__ == '__main__':
     assert torch.cuda.is_available(), "This script requires a CUDA-enabled GPU."

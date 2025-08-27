@@ -4,7 +4,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from typing import Iterable, Callable
+from collections.abc import Iterable, Callable
 
 from tabulate import tabulate
 import torch
@@ -37,7 +37,7 @@ class Trainer:
             'bf16': torch.bfloat16,
             'fp32': torch.float32,
         }[shared_cfg.dtype]
-        
+
         self.train_loader, self.test_loader = train_loader, test_loader
         self.model = model.to(
             device=self.device,
@@ -46,7 +46,7 @@ class Trainer:
 
         self.opt = make_optimizer(self.model)
         self.scheduler = make_scheduler(self.opt)
-        
+
         if self.cfg.save_every > 0:
             self.checkpoint_dir = f"{shared_cfg.base_dir}/checkpoints"
             os.makedirs(self.checkpoint_dir, exist_ok=True)
@@ -59,11 +59,11 @@ class Trainer:
         loader_iter = iter(self.train_loader)
         pbar = tqdm(range(1, self.cfg.train_steps+1), desc="Training")
         training_time = 0.0
-        
+
         # Start the clock.
         torch.cuda.synchronize()
         t0 = time.perf_counter()
-        
+
         scaler = torch.GradScaler(enabled=(self.dtype == torch.float16))
         for step in pbar:
             # ---- Training ---- #
@@ -84,7 +84,7 @@ class Trainer:
 
             # 4. Update our learning rate.
             self.scheduler.step()
-            
+
             if self.cfg.use_wandb:
                 wandb.log({
                     'train_loss': loss.item(),
@@ -97,7 +97,7 @@ class Trainer:
                 torch.cuda.synchronize()
                 interval_time = time.perf_counter() - t0
                 training_time += interval_time
-                
+
                 # Save a checkpoint.
                 if self.cfg.save_every > 0 and (
                     last_step or step % self.cfg.save_every == 0
@@ -107,14 +107,14 @@ class Trainer:
                         'optimizer': self.opt.state_dict(),
                         'step': step,
                     }, f"{self.checkpoint_dir}/{self.run_id}-step-{step}.pt")
-                
+
                 self.model.eval()
                 test_metrics = self.evaluate()
                 self.model.train()
-                
+
                 # Our trainining metrics are only estimates (computed on a single batch).
                 metrics = {
-                    "step": step, 
+                    "step": step,
                     "time": training_time,
                     "interval": interval_time,
                     "lr": self.scheduler.get_last_lr()[0],
@@ -129,7 +129,7 @@ class Trainer:
                 if self.cfg.use_wandb:
                     del metrics['step']
                     wandb.log(metrics, step)
-                
+
                 # Start the clock again.
                 torch.cuda.synchronize()
                 t0 = time.perf_counter()
@@ -137,7 +137,7 @@ class Trainer:
         torch.cuda.synchronize()
         training_time += time.perf_counter() - t0
         logging.info(f"Total training time: {training_time:,.2f}s")
-    
+
     @torch.inference_mode()
     def evaluate(self) -> dict[str, float]:
         assert not self.model.training, "Model must be in eval mode"
@@ -155,7 +155,7 @@ class Trainer:
             cum_loss += loss
             n_correct_top1 += (pred.argmax(dim=1) == labels).sum()
             n_correct_top5 += (pred.topk(5)[1] == labels.view(-1, 1)).sum()
-            
+
         return {
             "test_loss": cum_loss.item() / items,
             "test_acc1": n_correct_top1.item() / items,
@@ -170,10 +170,14 @@ LOGGING_COLUMNS = ['step', 'time', 'interval', 'lr', 'train_loss', 'train_acc1',
 HEADER_FMT = "|{:^6s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|{:^10s}|"
 ROW_FMT = "|{:>6d}|{:>10,.3f}|{:>10,.3f}|{:>10,.3e}|{:>10,.3f}|{:>10.3%}|{:>10.3%}|{:>10,.3f}|{:>10.3%}|{:>10.3%}|"
 
-def setup_logging(log_dir: str, cfg: ExperimentCfg, model_cfg: dataclass):
+def setup_logging(cfg: ExperimentCfg, model_cfg: dataclass):
     """Call before initializing a Trainer."""
+
+    log_dir = os.path.join(cfg.shared.base_dir, "logs")
     os.makedirs(log_dir, exist_ok=True)
-    logging.basicConfig(filename=f"{log_dir}/{cfg.shared.run_id}.txt", format="%(message)s", level=logging.INFO)
+    log_file = os.path.join(log_dir, f"{cfg.shared.run_id}.log")
+    logging.basicConfig(filename=log_file, format="%(message)s", level=logging.INFO)
+
     logging.info(" ".join(sys.argv))
     logging.info(f"Run ID: {cfg.shared.run_id}")
     logging.info(f"Running Python {sys.version} and PyTorch {torch.__version__}")
@@ -186,14 +190,15 @@ def setup_logging(log_dir: str, cfg: ExperimentCfg, model_cfg: dataclass):
 def finish_logging():
     """Call after training is complete."""
     try:
-        smi = subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        smi = subprocess.run(["nvidia-smi"], capture_output=True, text=True, check=True)
         logging.info(smi.stdout)
-    except Exception as e:
+        logging.info(smi.stderr)
+    except subprocess.CalledProcessError as e:
         logging.info(f"Error running nvidia-smi: {e}")
 
     logging.info(f"Max memory allocated: {torch.cuda.max_memory_allocated() // 1024**2:,} MiB")
     logging.info(f"Max memory reserved: {torch.cuda.max_memory_reserved() // 1024**2:,} MiB")
-    
+
     # Write entry point source to our logs.
     with open(sys.argv[0]) as f:
         logging.info(f.read())

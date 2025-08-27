@@ -37,7 +37,7 @@ class PreActConfig:
     "Whether the first block in each group downsamples the feature map size and doubles the number of channels."
     group_n_blocks: list[int] = field(default_factory=lambda: [9, 9, 9])
     "Number of blocks in each group."
-    
+
 
 # %% 2. Model
 
@@ -57,7 +57,7 @@ class PreActBlock(nn.Module):
         downsample: bool,
     ) -> None:
         super().__init__()
-        
+
         self.c_out = c_out = 2 * c_in if downsample else c_in
         stride = 2 if downsample else 1
 
@@ -106,15 +106,15 @@ class PreActResNet(nn.Module):
             for c_in, downsample, n_blocks in
             zip(cfg.group_c_ins, cfg.group_downsample, cfg.group_n_blocks)
         ])
-        
+
         # Output layer
         c_out = self.groups[-1][-1].c_out
         self.bn2 = nn.BatchNorm2d(c_out)
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.fc = nn.Linear(c_out, cfg.n_classes)
-        
+
         self.apply(self._init_weights)
-    
+
     def _make_group(
         self,
         c_in: int,
@@ -126,14 +126,14 @@ class PreActResNet(nn.Module):
             group.append(PreActBlock(group[-1].c_out, False))
 
         return nn.Sequential(*group)
-    
+
     @staticmethod
     def _init_weights(m: nn.Module) -> None:
         if isinstance(m, (nn.Conv2d, nn.Linear)):
             nn.init.kaiming_normal_(m.weight, mode="fan_in", nonlinearity="relu")
             if getattr(m, 'bias', None) is not None:
                 nn.init.zeros_(m.bias)
-        
+
     def forward(
         self,
         x: Float[Tensor, "batch channel height width"],
@@ -149,7 +149,7 @@ class PreActResNet(nn.Module):
 
 if __name__ == "__main__":
     assert torch.cuda.is_available(), "This script requires a CUDA-enabled GPU."
-    
+
     cfg = ExperimentCfg(
         trainer=TrainerCfg(
             train_steps=64_000,
@@ -161,7 +161,7 @@ if __name__ == "__main__":
             cutout_size=0,
         ),
     )
-    
+
     train_loader = TorchLoader(True, cfg.loader, cfg.shared)
     test_loader = TorchLoader(False, cfg.loader, cfg.shared)
 
@@ -172,7 +172,7 @@ if __name__ == "__main__":
             momentum=0.9,
             weight_decay=1e-4,
         )
-    
+
     def make_scheduler(optimizer: optim.Optimizer) -> optim.lr_scheduler.LRScheduler:
         warmup_steps = 400
         warmup = optim.lr_scheduler.ConstantLR(
@@ -183,15 +183,15 @@ if __name__ == "__main__":
             milestones=[32_000 - warmup_steps, 48_000 - warmup_steps],
             gamma=0.1,
         )
-        
+
         return optim.lr_scheduler.SequentialLR(
             optimizer, schedulers=[warmup, multistep], milestones=[warmup_steps]
         )
-    
+
     model_cfg = PreActConfig()
     model = PreActResNet(model_cfg)
 
-    setup_logging(f"{cfg.shared.base_dir}/logs", cfg, model_cfg)
+    setup_logging(cfg, model_cfg)
     trainer = Trainer(cfg.trainer, cfg.shared, train_loader, test_loader, make_optimizer, make_scheduler, model)
     trainer.train()
     finish_logging()

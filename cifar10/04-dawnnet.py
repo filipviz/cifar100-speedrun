@@ -60,7 +60,7 @@ class DAWNCfg:
     "Whether the first block in each group downsamples the feature map size and doubles the number of channels."
     group_n_blocks: list[int] = field(default_factory=lambda: [2, 2, 2, 2])
     "Number of blocks in each group."
-    
+
 
 # %% 2. Model
 
@@ -117,7 +117,7 @@ class DAWNNet(nn.Module):
     def __init__(self, cfg: DAWNCfg) -> None:
         super().__init__()
 
-        # Input layer (only a convolution)
+        # Input stem (only a convolution)
         self.conv1 = nn.Conv2d(3, cfg.input_conv_filters, 3, padding=1, bias=False)
 
         self.groups = nn.Sequential(*[
@@ -125,16 +125,16 @@ class DAWNNet(nn.Module):
             for c_in, downsample, n_blocks in
             zip(cfg.group_c_ins, cfg.group_downsample, cfg.group_n_blocks)
         ])
-        
+
         # Output layer
         c_out = self.groups[-1][-1].c_out
         self.bn2 = nn.BatchNorm2d(c_out)
         self.max_pool = nn.AdaptiveMaxPool2d(1)
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.fc = nn.Linear(2*c_out, cfg.n_classes)
-        
+
         self.apply(self._init_weights)
-    
+
     def _make_group(
         self,
         c_in: int,
@@ -145,14 +145,14 @@ class DAWNNet(nn.Module):
         for _ in range(1, n_blocks):
             group.append(DAWNBlock(group[-1].c_out, False))
         return nn.Sequential(*group)
-    
+
     @staticmethod
     def _init_weights(m: nn.Module) -> None:
         if isinstance(m, (nn.Conv2d, nn.Linear)):
             nn.init.kaiming_normal_(m.weight, mode="fan_in", nonlinearity="relu")
             if getattr(m, 'bias', None) is not None:
                 nn.init.zeros_(m.bias)
-        
+
     def forward(
         self,
         x: Float[Tensor, "batch channel height width"],
@@ -170,11 +170,11 @@ class DAWNNet(nn.Module):
 
 if __name__ == "__main__":
     assert torch.cuda.is_available(), "This script requires a CUDA-enabled GPU."
-    
+
     batch_size = 512
     steps_per_epoch = 50_000 // batch_size
     train_steps = steps_per_epoch * 35
-    
+
     cfg = ExperimentCfg(
         trainer=TrainerCfg(
             train_steps=train_steps,
@@ -188,7 +188,7 @@ if __name__ == "__main__":
 
     train_loader = GPULoader(True, cfg.loader, cfg.shared)
     test_loader = GPULoader(False, cfg.loader, cfg.shared)
-    
+
     def make_optimizer(model: nn.Module) -> optim.Optimizer:
         return optim.SGD(
             model.parameters(),
@@ -197,7 +197,7 @@ if __name__ == "__main__":
             weight_decay=5e-4,
             nesterov=True,
         )
-    
+
     def make_scheduler(optimizer: optim.Optimizer) -> optim.lr_scheduler.LRScheduler:
         lrs = [0, 0.44, 0.005, 0]
         epoch_milestones = [0, 15, 30, 35]
@@ -205,13 +205,13 @@ if __name__ == "__main__":
 
         def lr_fn(step: int) -> float:
             return np.interp(step, milestones, lrs).item()
-        
+
         return optim.lr_scheduler.LambdaLR(optimizer, lr_fn)
-        
+
     model_cfg = DAWNCfg()
     model = DAWNNet(model_cfg)
 
-    setup_logging(f"{cfg.shared.base_dir}/logs", cfg, model_cfg)
+    setup_logging(cfg, model_cfg)
     trainer = Trainer(cfg.trainer, cfg.shared, train_loader, test_loader, make_optimizer, make_scheduler, model)
     trainer.train()
     finish_logging()

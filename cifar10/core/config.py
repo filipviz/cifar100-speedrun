@@ -23,7 +23,7 @@ class TrainerCfg:
     "Set to 0 to disable evaluation."
     save_every: int = 0
     "Set to 0 to disable checkpointing. Must be a multiple of eval_every."
-    
+
     disable_logging: bool = False
 
     # --- Wandb --- #
@@ -71,7 +71,7 @@ class TorchLoaderCfg:
     "Set to 0 to disable padding and random cropping."
     cutout_size: int = 8
     "Set to 0 to disable cutout."
-    
+
     def __post_init__(self):
         assert not (self.normalize_he and self.normalize_torch), "Cannot normalize with both methods"
 
@@ -79,7 +79,7 @@ class TorchLoaderCfg:
 
 @dataclass
 class ExperimentCfg:
-    shared: SharedCfg = field(default_factory=SharedCfg)    
+    shared: SharedCfg = field(default_factory=SharedCfg)
     trainer: TrainerCfg = field(default_factory=TrainerCfg)
     loader: GPULoaderCfg = field(default_factory=GPULoaderCfg)
 
@@ -90,7 +90,7 @@ class ExperimentCfg:
     float32_matmul_precision: Literal['highest', 'high', 'medium'] = 'medium'
     seed: int = 20250825
     "Set to 0 to disable seeding."
-    
+
     def __post_init__(self):
         torch.backends.cudnn.allow_tf32 = self.allow_tf32
         torch.backends.cudnn.benchmark = self.cudnn_benchmark

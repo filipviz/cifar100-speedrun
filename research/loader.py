@@ -63,7 +63,7 @@ import torch.nn.functional as F
 from tqdm import trange
 # %%
 
-# assert torch.cuda.is_available(), "This script requires a CUDA-enabled GPU."
+assert torch.cuda.is_available(), "This script requires a CUDA-enabled GPU."
 
 torch.backends.cudnn.benchmark = True
 
@@ -93,7 +93,7 @@ def batch_crop(images: Float[Tensor, "b c h_in w_in"], crop_size: int = 32) -> F
     """Strided view-based (in-place) batch cropping."""
     b, c, h, w = images.shape
     r = (h - crop_size) // 2
- 
+
     # Create strided views of all possible crops.
     b_s, c_s, h_s, w_s = images.stride()
     crops_shape = (b, c, 2*r+1, 2*r+1, crop_size, crop_size)
@@ -102,7 +102,7 @@ def batch_crop(images: Float[Tensor, "b c h_in w_in"], crop_size: int = 32) -> F
         images[:, :, :h-crop_size+1, :w-crop_size+1],
         size=crops_shape, stride=crops_stride
     )
-    
+
     # Select the appropriate crop for each image.
     batch_idx = torch.arange(b, device=images.device)
     shift_h = torch.randint(0, 2*r+1, size=(b,), device=images.device)
@@ -155,20 +155,20 @@ class Cifar100Loader:
         # Transfer as uint8 then convert on GPU. This is faster than loading pre-processed fp16 data.
         data = torch.load(cifar_path, map_location=device)
         self.images, self.labels, self.classes = data['images'], data['labels'], data['classes']
-        
+
         # Convert to fp16, normalize, and rearrange on GPU
         self.images = self.images.to(DTYPE) / 255.0
         self.images = (self.images - CIFAR100_MEAN) / CIFAR100_STD
         if self.train and cfg.crop_padding > 0:
             self.images = F.pad(self.images, (0, 0) + (cfg.crop_padding,) * 4, mode=cfg.pad_mode)
         self.images = rearrange(self.images, "b h w c -> b c h w").to(memory_format=torch.channels_last)
-        
+
         self.n_images = len(self.images)
-    
+
     def __len__(self):
         # math.ceil(self.n_images / self.batch_size)
         return (self.n_images + self.batch_size - 1) // self.batch_size
-    
+
     def __iter__(self):
         indices = torch.randperm(self.n_images, device=self.device)
         position = 0
@@ -189,10 +189,10 @@ class Cifar100Loader:
                 position += self.batch_size
                 if last_batch and not self.train:
                     loop = False
-            
+
             images = self.images[batch_indices]
             labels = self.labels[batch_indices]
-            
+
             if self.train:
                 if self.cfg.crop_padding > 0:
                     images = batch_crop(images, crop_size=32)
@@ -203,7 +203,7 @@ class Cifar100Loader:
 
             yield images, labels
 
-# %% 
+# %%
 
 train_transform = v2.Compose([
     v2.ToImage(),
@@ -226,7 +226,7 @@ test_transform = v2.Compose([
 if __name__ == "__main__":
     if not os.path.exists(f"{BASE_DIR}/logs"):
         os.makedirs(f"{BASE_DIR}/logs", exist_ok=True)
-        
+
     log_id = datetime.now().isoformat(timespec="seconds")
     logging.basicConfig(
         format="%(message)s",
@@ -260,13 +260,13 @@ if __name__ == "__main__":
             fused=True,
         )
         return model, opt
-    
+
     def cleanup():
         gc.collect()
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         torch.cuda.synchronize()
-    
+
     def log_times(title, t0, t1, t2, t3):
         strs = [
             f"=== {title} ===",
@@ -280,16 +280,16 @@ if __name__ == "__main__":
         ]
         logging.info("\n".join(strs))
 
-    
+
     for batch_size in [128, 512, 768, 2048]:
 
         with contextlib.suppress(NameError):
-            del model, opt, cifar_train_loader, cifar_train_iter, batch, labels, out, loss
+            del model, opt, cifar_train_loader, cifar_train_iter, batch, labels, out, loss # noqa: F821
         cleanup()
 
         model, opt = model_and_opt()
         title = f"Torch train (bs={batch_size}, iters={TOTAL_ITERS})"
-        
+
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         torch_train_loader = DataLoader(
@@ -314,7 +314,7 @@ if __name__ == "__main__":
             except StopIteration:
                 torch_train_iter = iter(torch_train_loader)
                 batch, labels = next(torch_train_iter)
-                
+
             batch = batch.to(device=DEVICE, memory_format=torch.channels_last, non_blocking=True)
             labels = labels.to(device=DEVICE, non_blocking=True)
 
@@ -323,19 +323,19 @@ if __name__ == "__main__":
             loss.backward()
             opt.step()
             opt.zero_grad(set_to_none=True)
-            
+
         torch.cuda.synchronize()
         t3 = time.perf_counter()
         assert batch.is_contiguous(memory_format=torch.channels_last)
         log_times(title, t0, t1, t2, t3)
-        
+
         del model, opt, torch_train_loader, torch_train_iter, batch, labels, out, loss
         cleanup()
 
         model, opt = model_and_opt()
         cfg = Config(batch_size=batch_size)
         title = f"Cifar train (bs={batch_size}, iters={TOTAL_ITERS})"
-        
+
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         cifar_train_loader = Cifar100Loader(cfg, train=True, device=DEVICE)
@@ -358,7 +358,7 @@ if __name__ == "__main__":
         t3 = time.perf_counter()
         assert batch.is_contiguous(memory_format=torch.channels_last)
         log_times(title, t0, t1, t2, t3)
-    
+
     with torch.profiler.profile(
         profile_memory=True,
         with_stack=True,
@@ -368,5 +368,5 @@ if __name__ == "__main__":
         with torch.profiler.record_function("next"):
             for _ in range(10):
                 batch, labels = next(new_iter)
-    
+
     prof.export_chrome_trace(f"{BASE_DIR}/logs/loader-trace.json")

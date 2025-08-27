@@ -20,20 +20,20 @@ def batch_cutout_naive(images: Float[Tensor, "b c h w"], size: int) -> Float[Ten
     """Naive loop-based implementation of cutout."""
     if size <= 0:
         return images
-    
+
     batch_size, _, h, w = images.shape
     cutout_y = torch.randint(0, h, (batch_size,), device=images.device)
     cutout_x = torch.randint(0, w, (batch_size,), device=images.device)
-    
+
     y1 = torch.clamp(cutout_y - size // 2, 0, h)
     y2 = torch.clamp(cutout_y + size // 2, 0, h)
     x1 = torch.clamp(cutout_x - size // 2, 0, w)
     x2 = torch.clamp(cutout_x + size // 2, 0, w)
-    
+
     images = images.clone()
     for i in range(batch_size):
         images[i, :, y1[i]:y2[i], x1[i]:x2[i]] = 0
-    
+
     return images
 
 def batch_cutout_mask(images: Float[Tensor, "b c h w"], size: int) -> Float[Tensor, "b c h w"]:
@@ -53,10 +53,10 @@ def batch_cutout_mask(images: Float[Tensor, "b c h w"], size: int) -> Float[Tens
 
     max_h = torch.clamp_max(center_h + hi, h - 1)
     max_w = torch.clamp_max(center_w + hi, w - 1)
-    
+
     hs = torch.arange(h, device=dev).view(1, 1, h, 1)
     ws = torch.arange(w, device=dev).view(1, 1, 1, w)
-    
+
     mask = (hs >= min_h) & (hs < max_h) & (ws >= min_w) & (ws < max_w)
     images.masked_fill_(mask, 0)
 
@@ -85,7 +85,7 @@ def batch_cutout_sparse(images: Float[Tensor, "b c h w"], size: int) -> Float[Te
     images[b_idx, :, h_idx, w_idx] = 0
     return images
 
-# %% 
+# %%
 
 if __name__ == '__main__':
     assert torch.cuda.is_available(), "This script requires a CUDA-enabled GPU."

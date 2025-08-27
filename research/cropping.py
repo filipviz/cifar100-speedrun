@@ -14,11 +14,11 @@ def batch_crop_vec(images: Float[Tensor, "b c h_in w_in"], crop_size: int = 32) 
     n, c, h, w = images.shape
     r = (w - crop_size) // 2
     shifts = torch.randint(-r, r+1, size=(n, 2), device=images.device)
-    
+
     # Convert shifts to absolute positions
     y = r + shifts[:, 0]
     x = r + shifts[:, 1]
-    
+
     # Create index grids
     i = torch.arange(n, device=images.device).view(-1, 1, 1, 1)
     j = torch.arange(c, device=images.device).view(1, -1, 1, 1)
@@ -26,7 +26,7 @@ def batch_crop_vec(images: Float[Tensor, "b c h_in w_in"], crop_size: int = 32) 
     xx = torch.arange(crop_size, device=images.device).view(1, 1, 1, -1)
     y = y.view(-1, 1, 1, 1)
     x = x.view(-1, 1, 1, 1)
-    
+
     return images[i, j, y + yy, x + xx]
 
 def batch_crop_keller(images: Float[Tensor, "b c h_in w_in"], crop_size: int = 32) -> Float[Tensor, "b c h_out w_out"]:
@@ -59,7 +59,7 @@ def batch_crop_fast(images: Float[Tensor, "b c h_in w_in"], crop_size: int = 32)
     """Strided view-based batch cropping."""
     b, c, h, w = images.shape
     r = (h - crop_size) // 2
- 
+
     # Create strided views of all possible crops.
     b_s, c_s, h_s, w_s = images.stride()
     crops_shape = (b, c, 2*r+1, 2*r+1, crop_size, crop_size)
@@ -68,7 +68,7 @@ def batch_crop_fast(images: Float[Tensor, "b c h_in w_in"], crop_size: int = 32)
         images[:, :, :h-crop_size+1, :w-crop_size+1],
         size=crops_shape, stride=crops_stride
     )
-    
+
     # Select the appropriate crop for each image.
     batch_idx = torch.arange(b, device=images.device)
     shift_h = torch.randint(0, 2*r+1, size=(b,), device=images.device)

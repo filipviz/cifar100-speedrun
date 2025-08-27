@@ -45,9 +45,9 @@ class TorchLoader:
             cifar10_mean = (0.4914, 0.4822, 0.4465)
             cifar10_std = (0.2470, 0.2435, 0.2616)
             ops.append(v2.Normalize(cifar10_mean, cifar10_std))
-            
+
         transform = v2.Compose([op for op in ops if op is not None])
-        
+
         # --- Data --- #
         self.dataset = CIFAR10(root=self.data_dir, train=train, download=True, transform=transform)
         self.n_images = len(self.dataset)
@@ -60,12 +60,12 @@ class TorchLoader:
             drop_last=train,
             pin_memory=True,
         )
-    
+
     def __len__(self):
         # Needed for tqdm to work when self.train=False.
         assert not self.train, "__len__ is not defined for a TorchLoader with train=True"
         return len(self.loader)
-    
+
     def __iter__(self):
         while True:
             for (batch, labels) in self.loader:
@@ -75,7 +75,7 @@ class TorchLoader:
 
             if not self.train:
                 break
-    
+
     @cached_property
     def _cifar10_mean(self):
         mean_path = f"{self.data_dir}/cifar_10_mean.npy"
@@ -89,4 +89,3 @@ class TorchLoader:
             np_mean = np.load(mean_path)
 
         return torch.from_numpy(np_mean)
-    

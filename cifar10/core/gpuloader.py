@@ -1,7 +1,5 @@
 import os
-from typing import Literal
 import torch
-from dataclasses import dataclass, field
 from torch import Tensor
 from jaxtyping import Float
 from torchvision.datasets import CIFAR10
@@ -10,7 +8,7 @@ from einops import rearrange
 
 from .config import GPULoaderCfg, SharedCfg
 
-    
+
 
 class GPULoader:
     """
@@ -37,7 +35,7 @@ class GPULoader:
         # Transfer as uint8 then convert on GPU. This is faster than loading pre-processed fp16 data.
         data = torch.load(cifar_path, map_location=self.device)
         self.images, self.labels, self.classes = data['images'], data['labels'], data['classes']
-        
+
         # Convert to floats, normalize, and rearrange on GPU.
         # I tried doing this in fp16 but it didn't make a difference.
         self.images = self.images.to(torch.float32) / 255.0
@@ -46,16 +44,16 @@ class GPULoader:
         if train and cfg.crop_padding > 0:
             self.images = F.pad(self.images, (0, 0) + (cfg.crop_padding,) * 4, mode=cfg.pad_mode)
         self.images = rearrange(self.images, "b h w c -> b c h w").to(memory_format=torch.channels_last)
-        
+
         self.n_images = len(self.images)
         assert self.batch_size <= 2 * self.n_images, "To support this batch size you have to update __iter__"
-    
+
     def __len__(self):
         # Needed for tqdm to work when self.train=False.
         # math.ceil(self.n_images / self.batch_size)
         assert not self.train, "__len__ is not defined for a GPULoader with train=True"
         return (self.n_images + self.batch_size - 1) // self.batch_size
-    
+
     def __iter__(self):
         position = 0
         if not self.train:
@@ -81,10 +79,10 @@ class GPULoader:
                 # Otherwise, we take the next batch of indices from the current epoch.
                 batch_indices = indices[position:position + self.batch_size]
                 position += self.batch_size
-            
+
             images = self.images[batch_indices]
             labels = self.labels[batch_indices]
-            
+
             if self.cfg.crop_padding > 0:
                 images = batch_crop(images, crop_size=32)
             if self.cfg.flip:
@@ -99,7 +97,7 @@ def batch_crop(images: Float[Tensor, "b c h_in w_in"], crop_size: int = 32) -> F
     """Strided view-based (in-place) batch cropping."""
     b, c, h, w = images.shape
     r = (h - crop_size) // 2
- 
+
     # Create strided views of all possible crops.
     b_s, c_s, h_s, w_s = images.stride()
     crops_shape = (b, c, 2*r+1, 2*r+1, crop_size, crop_size)
@@ -108,7 +106,7 @@ def batch_crop(images: Float[Tensor, "b c h_in w_in"], crop_size: int = 32) -> F
         images[:, :, :h-crop_size+1, :w-crop_size+1],
         size=crops_shape, stride=crops_stride
     )
-    
+
     # Select the appropriate crop for each image.
     batch_idx = torch.arange(b, device=images.device)
     shift_h = torch.randint(0, 2*r+1, size=(b,), device=images.device)
