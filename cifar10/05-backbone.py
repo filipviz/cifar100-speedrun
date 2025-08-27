@@ -39,11 +39,10 @@ TODO:
 - Use Page's weight decay.
 """
 
-# %% 1. Configuration and Hyperparameters
+# %% 1. Model Hyperparameters
 
 @dataclass
 class BackboneCfg:
-    # --- Model architecture --- #
     n_classes: int = 10
     input_conv_filters: int = 64
     "c_out for the convolution applied to the input."
