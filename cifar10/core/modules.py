@@ -36,16 +36,16 @@ class GhostBatchNorm(nn.BatchNorm2d):
                 self.running_var.view(self.num_splits, self.num_features), dim=0
             ).repeat(self.num_splits)
         return super().train(mode)
-        
+
     def forward(self, input):
         if self.training or not self.track_running_stats:
             N, C, H, W = input.shape
             assert N % self.num_splits == 0, f"batch size {N} not divisible by num_splits {self.num_splits}"
             return F.batch_norm(
-                input.view(-1, C * self.num_splits, H, W), self.running_mean, self.running_var, 
+                input.view(-1, C * self.num_splits, H, W), self.running_mean, self.running_var,
                 self.weight.repeat(self.num_splits), self.bias.repeat(self.num_splits),
-                True, self.momentum, self.eps).view(N, C, H, W) 
+                True, self.momentum, self.eps).view(N, C, H, W)
         else:
             return F.batch_norm(
-                input, self.running_mean[:self.num_features], self.running_var[:self.num_features], 
+                input, self.running_mean[:self.num_features], self.running_var[:self.num_features],
                 self.weight, self.bias, False, self.momentum, self.eps)

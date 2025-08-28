@@ -6,7 +6,7 @@ from torch import nn, Tensor, optim
 import torch.nn.functional as F
 from jaxtyping import Float
 
-from core.config import ExperimentCfg, TorchLoaderCfg, TrainerCfg
+from core.config import ExperimentCfg, TrainerCfg
 from core.torchloader import TorchLoader
 from core.trainer import Trainer, finish_logging, setup_logging
 

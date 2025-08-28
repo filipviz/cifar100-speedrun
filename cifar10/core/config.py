@@ -23,7 +23,7 @@ class TrainerCfg:
     "Set to 0 to disable evaluation."
     save_every: int = 0
     "Set to 0 to disable checkpointing. Must be a multiple of eval_every."
-    
+
     label_smoothing: float = 0.0
     "Label smoothing epsilon. Set to 0 to disable."
 

@@ -4,8 +4,8 @@ from dataclasses import dataclass, field
 from jaxtyping import Float
 import torch
 from torch import nn, optim, Tensor
-import torch.nn.functional as F
 
+from core.modules import GhostBatchNorm
 from core.gpuloader import GPULoader
 from core.trainer import Trainer, finish_logging, setup_logging
 from core.config import ExperimentCfg, GPULoaderCfg, TrainerCfg
@@ -39,6 +39,8 @@ class MyrtleCfg:
     fc_scale: float = 0.125
     "We scale the activations by this amount before the softmax."
     celu_alpha: float = 0.075
+    num_splits: int = 16
+    "The number of ghost batches to use for GhostBatchNorm. Should be batch_size // ghost_batch_size."
 
 # %% 2. Model
 
@@ -52,41 +54,48 @@ class MyrtleBlock(nn.Module):
         residual: Whether to add two serial 3x3 convolution -> batchnorm -> CELU sequences with an identity shortcut.
     """
 
-    def __init__(self, c_in: int, c_out: int, residual: bool = False, celu_alpha: float = 0.075):
+    def __init__(
+        self,
+        c_in: int,
+        c_out: int,
+        residual: bool = False,
+        celu_alpha: float = 0.075,
+        num_splits: int = 32,
+    ):
         super().__init__()
         self.residual = residual
 
         self.conv1 = nn.Conv2d(c_in, c_out, 3, padding=1, bias=False)
         self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
-        self.bn1 = nn.BatchNorm2d(c_out)
+        self.gbn1 = GhostBatchNorm(c_out, num_splits=num_splits)
         self.celu = nn.CELU(alpha=celu_alpha)
 
         if residual:
             self.conv2 = nn.Conv2d(c_out, c_out, 3, padding=1, bias=False)
-            self.bn2 = nn.BatchNorm2d(c_out)
+            self.gbn2 = GhostBatchNorm(c_out, num_splits=num_splits)
 
             self.conv3 = nn.Conv2d(c_out, c_out, 3, padding=1, bias=False)
-            self.bn3 = nn.BatchNorm2d(c_out)
+            self.gbn3 = GhostBatchNorm(c_out, num_splits=num_splits)
 
     def forward(
         self, x: Float[Tensor, "batch c_in h_in w_in"]
     ) -> Float[Tensor, "batch c_out h_out w_out"]:
         """h_out and w_out are one half of h_in and w_in, respectively."""
         out = self.pool(self.conv1(x))
-        out = self.celu(self.bn1(out))
+        out = self.celu(self.gbn1(out))
 
         if self.residual:
-            res = self.celu(self.bn2(self.conv2(out)))
-            res = self.celu(self.bn3(self.conv3(res)))
+            res = self.celu(self.gbn2(self.conv2(out)))
+            res = self.celu(self.gbn3(self.conv3(res)))
             out = out + res
 
         return out
-    
+
 class MyrtleResnet(torch.nn.Module):
     def __init__(self, cfg: MyrtleCfg):
         super().__init__()
         self.conv = nn.Conv2d(3, cfg.input_conv_filters, 3, padding=1, bias=False)
-        self.bn = nn.BatchNorm2d(cfg.input_conv_filters)
+        self.gbn = GhostBatchNorm(cfg.input_conv_filters, num_splits=cfg.num_splits)
         self.celu = nn.CELU(alpha=cfg.celu_alpha)
 
         n_groups = len(cfg.group_residual)
@@ -96,8 +105,8 @@ class MyrtleResnet(torch.nn.Module):
         ]
 
         self.layers = nn.Sequential(*[
-            MyrtleBlock(c_in, c_out, res, cfg.celu_alpha) for c_in, c_out, res in
-            zip(c_ins, c_ins[1:], cfg.group_residual)
+            MyrtleBlock(c_in, c_out, res, cfg.celu_alpha, cfg.num_splits)
+            for c_in, c_out, res in zip(c_ins, c_ins[1:], cfg.group_residual)
         ])
 
         self.pool = nn.AdaptiveMaxPool2d(1)
@@ -105,12 +114,12 @@ class MyrtleResnet(torch.nn.Module):
         self.fc_scale = cfg.fc_scale
 
     def forward(self, x: Float[Tensor, "batch channel height width"]) -> Float[Tensor, "batch n_classes"]:
-        out = self.celu(self.bn(self.conv(x)))
+        out = self.celu(self.gbn(self.conv(x)))
         out = self.layers(out)
         out = self.pool(out).flatten(start_dim=1)
         out = self.fc(out) * self.fc_scale
         return out
-    
+
 # %% 3. Training and Evaluation
 
 if __name__ == "__main__":
@@ -120,7 +129,7 @@ if __name__ == "__main__":
     steps_per_epoch = (50_000 + batch_size - 1) // batch_size
     train_steps = steps_per_epoch * 20
     warmup_steps = train_steps // 5
-    
+
     cfg = ExperimentCfg(
         trainer=TrainerCfg(
             train_steps=train_steps,
@@ -134,7 +143,7 @@ if __name__ == "__main__":
 
     train_loader = GPULoader(True, cfg.loader, cfg.shared)
     test_loader = GPULoader(False, cfg.loader, cfg.shared)
-    
+
     def make_optimizer(model: nn.Module) -> optim.Optimizer:
         return optim.SGD(
             model.parameters(),
@@ -156,7 +165,10 @@ if __name__ == "__main__":
             optimizer, schedulers=[warmup, decay], milestones=[warmup_steps]
         )
 
-    model_cfg = MyrtleCfg()
+    ghost_batch_size = 32
+    model_cfg = MyrtleCfg(
+        num_splits=batch_size // ghost_batch_size
+    )
     model = MyrtleResnet(model_cfg)
 
     setup_logging(cfg, model_cfg)

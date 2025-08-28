@@ -37,7 +37,7 @@ class Trainer:
             'bf16': torch.bfloat16,
             'fp32': torch.float32,
         }[shared_cfg.dtype]
-        
+
         self.autocast_enabled = self.dtype != torch.float32
         self.train_loader, self.test_loader = train_loader, test_loader
         self.model = model.to(
