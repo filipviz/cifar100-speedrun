@@ -111,7 +111,7 @@ class PreActResNet(nn.Module):
         c_out = self.groups[-1][-1].c_out
         self.bn2 = nn.BatchNorm2d(c_out)
         self.pool = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Linear(c_out, cfg.n_classes)
+        self.fc = nn.Linear(c_out, cfg.n_classes, bias=False)
 
         self.apply(self._init_weights)
 

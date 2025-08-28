@@ -120,7 +120,7 @@ class ResNet(nn.Module):
         # Output layer
         self.pool = nn.AdaptiveAvgPool2d(1)
         c_out = self.groups[-1][-1].c_out
-        self.fc = nn.Linear(c_out, cfg.n_classes)
+        self.fc = nn.Linear(c_out, cfg.n_classes, bias=False)
 
         self.apply(self._init_weights)
 

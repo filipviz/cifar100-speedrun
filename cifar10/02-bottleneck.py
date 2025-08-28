@@ -109,7 +109,7 @@ class BottleneckResNet(nn.Module):
 
         # Output layer
         self.pool = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Linear(cfg.group_chs[-1], cfg.n_classes)
+        self.fc = nn.Linear(cfg.group_chs[-1], cfg.n_classes, bias=False)
 
         self.apply(self._init_weights)
 

@@ -132,7 +132,7 @@ class DAWNNet(nn.Module):
         self.bn2 = nn.BatchNorm2d(c_out)
         self.max_pool = nn.AdaptiveMaxPool2d(1)
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Linear(2*c_out, cfg.n_classes)
+        self.fc = nn.Linear(2*c_out, cfg.n_classes, bias=False)
 
         self.apply(self._init_weights)
 
@@ -173,7 +173,7 @@ if __name__ == "__main__":
     assert torch.cuda.is_available(), "This script requires a CUDA-enabled GPU."
 
     batch_size = 512
-    steps_per_epoch = 50_000 // batch_size
+    steps_per_epoch = (50_000 + batch_size - 1) // batch_size
     train_steps = steps_per_epoch * 35
 
     cfg = ExperimentCfg(

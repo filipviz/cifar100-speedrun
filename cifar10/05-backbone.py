@@ -50,7 +50,7 @@ class BackboneCfg:
     group_residual: list[bool] = field(default_factory=lambda: [True, False, True])
     "Whether each group has a residual block."
     fc_scale: float = 0.125
-    "We scale the final classifier layer by this amount."
+    "We scale the activations by this amount before the softmax."
 
 # %% 2. Model
 
@@ -112,15 +112,14 @@ class BackboneResnet(nn.Module):
         ])
 
         self.pool = nn.AdaptiveMaxPool2d(1)
-        self.fc = nn.Linear(c_ins[-1], cfg.n_classes)
-        with torch.no_grad():
-            self.fc.weight.mul_(cfg.fc_scale)
+        self.fc = nn.Linear(c_ins[-1], cfg.n_classes, bias=False)
+        self.fc_scale = cfg.fc_scale
 
     def forward(self, x: Float[Tensor, "batch channel height width"]) -> Float[Tensor, "batch n_classes"]:
         out = F.relu(self.bn(self.conv(x)), inplace=True)
         out = self.layers(out)
         out = self.pool(out).flatten(start_dim=1)
-        out = self.fc(out)
+        out = self.fc(out) * self.fc_scale
         return out
 
 # %% 3. Training and Evaluation
@@ -129,7 +128,7 @@ if __name__ == "__main__":
     assert torch.cuda.is_available(), "This script requires a CUDA-enabled GPU."
 
     batch_size = 512
-    steps_per_epoch = 50_000 // batch_size
+    steps_per_epoch = (50_000 + batch_size - 1) // batch_size
     warmup_steps = steps_per_epoch * 5
     train_steps = steps_per_epoch * 24
 
