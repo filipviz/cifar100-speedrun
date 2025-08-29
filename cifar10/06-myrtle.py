@@ -39,7 +39,7 @@ class MyrtleCfg:
     fc_scale: float = 0.125
     "We scale the activations by this amount before the softmax."
     celu_alpha: float = 0.075
-    num_splits: int = 16
+    n_splits: int = 16
     "The number of ghost batches to use for GhostBatchNorm. Should be batch_size // ghost_batch_size."
 
 # %% 2. Model
@@ -60,22 +60,22 @@ class MyrtleBlock(nn.Module):
         c_out: int,
         residual: bool = False,
         celu_alpha: float = 0.075,
-        num_splits: int = 32,
+        n_splits: int = 32,
     ):
         super().__init__()
         self.residual = residual
 
         self.conv1 = nn.Conv2d(c_in, c_out, 3, padding=1, bias=False)
         self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
-        self.gbn1 = GhostBatchNorm(c_out, num_splits=num_splits)
+        self.gbn1 = GhostBatchNorm(c_out, n_splits=n_splits)
         self.celu = nn.CELU(alpha=celu_alpha)
 
         if residual:
             self.conv2 = nn.Conv2d(c_out, c_out, 3, padding=1, bias=False)
-            self.gbn2 = GhostBatchNorm(c_out, num_splits=num_splits)
+            self.gbn2 = GhostBatchNorm(c_out, n_splits=n_splits)
 
             self.conv3 = nn.Conv2d(c_out, c_out, 3, padding=1, bias=False)
-            self.gbn3 = GhostBatchNorm(c_out, num_splits=num_splits)
+            self.gbn3 = GhostBatchNorm(c_out, n_splits=n_splits)
 
     def forward(
         self, x: Float[Tensor, "batch c_in h_in w_in"]
@@ -95,7 +95,7 @@ class MyrtleResnet(torch.nn.Module):
     def __init__(self, cfg: MyrtleCfg):
         super().__init__()
         self.conv = nn.Conv2d(3, cfg.input_conv_filters, 3, padding=1, bias=False)
-        self.gbn = GhostBatchNorm(cfg.input_conv_filters, num_splits=cfg.num_splits)
+        self.gbn = GhostBatchNorm(cfg.input_conv_filters, n_splits=cfg.n_splits)
         self.celu = nn.CELU(alpha=cfg.celu_alpha)
 
         n_groups = len(cfg.group_residual)
@@ -105,7 +105,7 @@ class MyrtleResnet(torch.nn.Module):
         ]
 
         self.layers = nn.Sequential(*[
-            MyrtleBlock(c_in, c_out, res, cfg.celu_alpha, cfg.num_splits)
+            MyrtleBlock(c_in, c_out, res, cfg.celu_alpha, cfg.n_splits)
             for c_in, c_out, res in zip(c_ins, c_ins[1:], cfg.group_residual)
         ])
 
@@ -167,7 +167,7 @@ if __name__ == "__main__":
 
     ghost_batch_size = 32
     model_cfg = MyrtleCfg(
-        num_splits=batch_size // ghost_batch_size
+        n_splits=batch_size // ghost_batch_size
     )
     model = MyrtleResnet(model_cfg)
 
