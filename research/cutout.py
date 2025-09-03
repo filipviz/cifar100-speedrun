@@ -8,11 +8,12 @@ A 6045x speedup!
 """
 # %%
 import torch
-from torch.utils import benchmark
 from torch import Tensor
 from jaxtyping import Float
-from torchvision.datasets import CIFAR100
+from torchvision.datasets import CIFAR10
 from einops import rearrange
+
+from bench_utils import benchmark
 
 # %%
 
@@ -88,17 +89,25 @@ def batch_cutout_sparse(images: Float[Tensor, "b c h w"], size: int) -> Float[Te
 # %%
 
 if __name__ == '__main__':
-    assert torch.cuda.is_available(), "This script requires a CUDA-enabled GPU."
     device, dtype = 'cuda', torch.float16
 
-    cifar = CIFAR100(root='data', train=True, download=True)
+    cifar = CIFAR10(root='data', train=True, download=True)
     imgs = torch.tensor(cifar.data).to(device)
     imgs = rearrange(imgs, 'b h w c -> b c h w').to(dtype, memory_format=torch.channels_last) / 255.0
 
-    for impl in [batch_cutout_naive, batch_cutout_mask, batch_cutout_sparse]:
-        t = benchmark.Timer(
-            stmt='impl(images, 8)',
-            setup='images = imgs.clone()',
-            globals={'impl': impl, 'imgs': imgs},
-        )
-        print(f"{impl.__name__}: {t.timeit(100)}")
+    variants = [
+        # batch_cutout_naive is extremely slow.
+        # ("batch_cutout_naive", batch_cutout_naive),
+        ("batch_cutout_mask", batch_cutout_mask),
+        ("batch_cutout_sparse", batch_cutout_sparse),
+    ]
+
+    def make_inputs():
+        return (imgs.clone(), 8)
+
+    benchmark(
+        variants=variants,
+        make_inputs=make_inputs,
+        iters=100,
+        warmup=10,
+    )

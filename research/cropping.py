@@ -3,12 +3,12 @@
 import torch
 from torch import Tensor
 from jaxtyping import Float
-from torchvision.datasets import CIFAR100
+from torchvision.datasets import CIFAR10
 from einops import rearrange
 import torch.nn.functional as F
-from torch.utils import benchmark
 
-# %%
+from bench_utils import benchmark
+
 def batch_crop_vec(images: Float[Tensor, "b c h_in w_in"], crop_size: int = 32) -> Float[Tensor, "b c h_out w_out"]:
     """Vectorized cropping using index grids."""
     n, c, h, w = images.shape
@@ -80,17 +80,25 @@ def batch_crop_fast(images: Float[Tensor, "b c h_in w_in"], crop_size: int = 32)
 if __name__ == '__main__':
     assert torch.cuda.is_available(), "This script requires a CUDA-enabled GPU."
 
-    cifar = CIFAR100(root='data', train=True, download=True)
+    cifar = CIFAR10(root='data', train=True, download=True)
     imgs = torch.tensor(cifar.data).to('cuda')
     imgs = rearrange(imgs, 'b h w c -> b c h w').to(torch.float16, memory_format=torch.channels_last) / 255.0
 
     # Methods assume images are already padded.
     img_pad = F.pad(imgs, (4,) * 4, mode='constant', value=0)
 
-    for impl in [batch_crop_vec, batch_crop_keller, batch_crop_fast]:
-        t = benchmark.Timer(
-            stmt='impl(images, 8)',
-            setup='images = imgs.clone()',
-            globals={'impl': impl, 'imgs': imgs},
-        )
-        print(f"{impl.__name__}: {t.timeit(10)}")
+    variants = [
+        ("batch_crop_vec", batch_crop_vec),
+        ("batch_crop_keller", batch_crop_keller),
+        ("batch_crop_fast", batch_crop_fast),
+    ]
+
+    def make_inputs():
+        return (img_pad.clone(), 32)
+
+    benchmark(
+        variants=variants,
+        make_inputs=make_inputs,
+        iters=10,
+        warmup=5,
+    )

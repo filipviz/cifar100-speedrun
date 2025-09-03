@@ -44,6 +44,8 @@ class Trainer:
             device=self.device,
             memory_format=torch.channels_last
         )
+        if shared_cfg.compile_enabled:
+            self.model = torch.compile(self.model, mode=shared_cfg.compile_mode)
 
         self.opt = make_optimizer(self.model)
         self.scheduler = make_scheduler(self.opt)

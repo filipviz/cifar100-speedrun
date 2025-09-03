@@ -3,9 +3,10 @@
 import torch
 from torch import Tensor
 from jaxtyping import Float
-from torchvision.datasets import CIFAR100
+from torchvision.datasets import CIFAR10
 from einops import rearrange
-from torch.utils import benchmark
+
+from bench_utils import benchmark
 
 # %%
 
@@ -42,14 +43,22 @@ if __name__ == '__main__':
     assert torch.cuda.is_available(), "This script requires a CUDA-enabled GPU."
     device, dtype = 'cuda', torch.float16
 
-    cifar = CIFAR100(root='data', train=True, download=True)
+    cifar = CIFAR10(root='data', train=True, download=True)
     imgs = torch.tensor(cifar.data).to(device)
     imgs = rearrange(imgs, 'b h w c -> b c h w').to(dtype, memory_format=torch.channels_last) / 255.0
 
-    for impl in [batch_flip_naive, batch_flip_bool, batch_flip_gather]:
-        t = benchmark.Timer(
-            stmt='impl(images)',
-            setup='images = imgs.clone()',
-            globals={'impl': impl, 'imgs': imgs},
-        )
-        print(f"{impl.__name__}: {t.timeit(100)}")
+    variants = [
+        ("batch_flip_naive", batch_flip_naive),
+        ("batch_flip_bool", batch_flip_bool),
+        ("batch_flip_gather", batch_flip_gather),
+    ]
+
+    def make_inputs():
+        return (imgs.clone(),)
+
+    benchmark(
+        variants=variants,
+        make_inputs=make_inputs,
+        iters=100,
+        warmup=10,
+    )

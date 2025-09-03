@@ -12,7 +12,10 @@ class SharedCfg:
     dtype: Literal['fp16', 'bf16', 'fp32'] = 'fp16'
     base_dir: str = os.getcwd()
     run_id: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
-
+    
+    # --- torch.compile --- #
+    compile_enabled: bool = False
+    compile_mode: Literal['default', 'reduce-overhead', 'max-autotune'] = 'default'
 
 @dataclass
 class TrainerCfg:

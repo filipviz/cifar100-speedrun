@@ -9,7 +9,6 @@ from einops import rearrange
 from .config import GPULoaderCfg, SharedCfg
 
 
-
 class GPULoader:
     """
     GPU-accelerated data loader for CIFAR-10. Loads entire dataset into GPU memory, performs transformations on GPU, and doesn't require re-initialization each epoch. Ignores the shared_cfg.dtype.
@@ -47,6 +46,19 @@ class GPULoader:
 
         self.n_images = len(self.images)
         assert self.batch_size <= 2 * self.n_images, "To support this batch size you have to update __iter__"
+        
+        if train:
+            @torch.compile(mode=shared_cfg.compile_mode, disable=(not shared_cfg.compile_enabled))
+            def augment(images: Float[Tensor, "b c h_in w_in"]) -> Float[Tensor, "b c h_out w_out"]:
+                if cfg.crop_padding > 0:
+                    images = batch_crop(images, crop_size=32)
+                if cfg.flip:
+                    images = batch_flip_lr(images)
+                if cfg.cutout_size > 0:
+                    images = batch_cutout(images, size=cfg.cutout_size)
+                return images
+
+            self.augment = augment
 
     def __len__(self):
         # Needed for tqdm to work when self.train=False.
@@ -83,13 +95,7 @@ class GPULoader:
             images = self.images[batch_indices]
             labels = self.labels[batch_indices]
 
-            if self.cfg.crop_padding > 0:
-                images = batch_crop(images, crop_size=32)
-            if self.cfg.flip:
-                images = batch_flip_lr(images)
-            if self.cfg.cutout_size > 0:
-                images = batch_cutout(images, size=self.cfg.cutout_size)
-
+            images = self.augment(images)
             yield images, labels
 
 
