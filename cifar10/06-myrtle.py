@@ -124,6 +124,7 @@ class MyrtleResnet(torch.nn.Module):
 
 if __name__ == "__main__":
     assert torch.cuda.is_available(), "This script requires a CUDA-enabled GPU."
+    # torch._logging.set_logs(recompiles=True, dynamic=True, graph_breaks=True)
 
     batch_size = 512
     steps_per_epoch = (50_000 + batch_size - 1) // batch_size
@@ -151,10 +152,11 @@ if __name__ == "__main__":
     def make_optimizer(model: nn.Module) -> optim.Optimizer:
         return optim.SGD(
             model.parameters(),
-            lr=0.4,
+            lr=torch.tensor(0.4),
             momentum=0.9,
             weight_decay=5e-4,
             nesterov=True,
+            fused=True,
         )
 
     def make_scheduler(optimizer: optim.Optimizer) -> optim.lr_scheduler.LRScheduler:

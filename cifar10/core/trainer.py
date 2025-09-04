@@ -44,11 +44,14 @@ class Trainer:
             device=self.device,
             memory_format=torch.channels_last
         )
-        if shared_cfg.compile_enabled:
-            self.model = torch.compile(self.model, mode=shared_cfg.compile_mode)
 
         self.opt = make_optimizer(self.model)
         self.scheduler = make_scheduler(self.opt)
+
+        if shared_cfg.compile_enabled:
+            self.model.compile(mode=shared_cfg.compile_mode)
+            self.opt.step = torch.compile(self.opt.step, mode=shared_cfg.compile_mode)
+            self.scheduler.step = torch.compile(self.scheduler.step, mode=shared_cfg.compile_mode)
 
         if self.cfg.save_every > 0:
             self.checkpoint_dir = os.path.join(shared_cfg.base_dir, "checkpoints")

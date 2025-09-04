@@ -38,7 +38,6 @@ class GhostBatchNorm(nn.BatchNorm2d):
     def forward(self, input):
         if self.training or not self.track_running_stats:
             N, C, H, W = input.shape
-            stride = input.stride()
             assert N % self.num_splits == 0, f"batch size {N} not divisible by num_splits {self.num_splits}"
             return F.batch_norm(
                 input.reshape(-1, C * self.num_splits, H, W), self.running_mean, self.running_var,

@@ -193,10 +193,11 @@ if __name__ == "__main__":
     def make_optimizer(model: nn.Module) -> optim.Optimizer:
         return optim.SGD(
             model.parameters(),
-            lr=1.0,
+            lr=torch.tensor(1.0),
             momentum=0.9,
             weight_decay=5e-4,
             nesterov=True,
+            fused=True,
         )
 
     def make_scheduler(optimizer: optim.Optimizer) -> optim.lr_scheduler.LRScheduler:

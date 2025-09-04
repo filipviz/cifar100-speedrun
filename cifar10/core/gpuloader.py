@@ -46,7 +46,7 @@ class GPULoader:
 
         self.n_images = len(self.images)
         assert self.batch_size <= 2 * self.n_images, "To support this batch size you have to update __iter__"
-        
+
         if train:
             @torch.compile(mode=shared_cfg.compile_mode, disable=(not shared_cfg.compile_enabled))
             def augment(images: Float[Tensor, "b c h_in w_in"]) -> Float[Tensor, "b c h_out w_out"]:

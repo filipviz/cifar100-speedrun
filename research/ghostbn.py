@@ -2,7 +2,6 @@
 import torch
 import torch.nn.functional as F
 from torch import nn
-from einops import rearrange
 
 from bench_utils import benchmark
 
@@ -44,7 +43,6 @@ class GBN_Vectorized(nn.BatchNorm2d):
     def forward(self, input):
         if self.training or not self.track_running_stats:
             N, C, H, W = input.shape
-            stride = input.stride()
             assert N % self.num_splits == 0, f"batch size {N} not divisible by num_splits {self.num_splits}"
             return F.batch_norm(
                 input.reshape(-1, C * self.num_splits, H, W), self.running_mean, self.running_var,
@@ -128,6 +126,7 @@ class BN_Page(nn.BatchNorm2d):
         self.bias.requires_grad = bias
 
 class GBN_Page(BN_Page):
+    """Page's implementation doesn't support channels_last, so we've slightly modified it."""
     def __init__(self, num_features, num_splits, device=None, dtype=None, **kw):
         super().__init__(num_features, device=device, dtype=dtype, **kw)
         self.num_splits = num_splits
@@ -139,17 +138,17 @@ class GBN_Page(BN_Page):
             self.running_mean = torch.mean(self.running_mean.view(self.num_splits, self.num_features), dim=0).repeat(self.num_splits)
             self.running_var = torch.mean(self.running_var.view(self.num_splits, self.num_features), dim=0).repeat(self.num_splits)
         return super().train(mode)
-        
+
     def forward(self, input):
         N, C, H, W = input.shape
         if self.training or not self.track_running_stats:
             return F.batch_norm(
-                input.reshape(-1, C*self.num_splits, H, W), self.running_mean, self.running_var, 
+                input.reshape(-1, C*self.num_splits, H, W), self.running_mean, self.running_var,
                 self.weight.repeat(self.num_splits), self.bias.repeat(self.num_splits),
                 True, self.momentum, self.eps).reshape(N, C, H, W).to(memory_format=torch.channels_last)
         else:
             return F.batch_norm(
-                input, self.running_mean[:self.num_features], self.running_var[:self.num_features], 
+                input, self.running_mean[:self.num_features], self.running_var[:self.num_features],
                 self.weight, self.bias, False, self.momentum, self.eps)
 
 
@@ -179,7 +178,7 @@ if __name__ == "__main__":
     def make_inputs_train():
         return (x.clone(memory_format=fmt),)
 
-    print(f"=== train ===")
+    print("=== train ===")
     benchmark(
         variants=train_variants,
         make_inputs=make_inputs_train,
@@ -199,7 +198,7 @@ if __name__ == "__main__":
     def make_inputs_eval():
         return (x.clone(memory_format=fmt),)
 
-    print(f"=== eval ===")
+    print("=== eval ===")
     benchmark(
         variants=eval_variants,
         make_inputs=make_inputs_eval,
@@ -216,7 +215,7 @@ if __name__ == "__main__":
         assert x.is_contiguous(memory_format=fmt), f"{x.is_contiguous(memory_format=fmt)=}"
         assert y_gbn.is_contiguous(memory_format=fmt), f"{impl.__name__} is not {fmt}"
         assert x.shape == y_gbn.shape, f"{x.shape=}, {y_gbn.shape=}"
-        
+
         gbn_single = impl(num_features=features, num_splits=1, device=device, dtype=dtype)
         y_gbn_single = gbn_single(x)
         torch.testing.assert_close(y_bn, y_gbn_single)
