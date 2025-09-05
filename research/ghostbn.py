@@ -117,6 +117,94 @@ class GBN_Chunked(nn.Module):
             )
             return y.to(memory_format=torch.channels_last)
 
+class GBN_Chunked_v2(nn.Module):
+    def __init__(self, num_features: int, num_splits: int, eps: float = 1e-5, momentum: float = 0.1, affine: bool = True,
+                 track_running_stats: bool = True, device=None, dtype=None):
+        super().__init__()
+        if momentum is None:
+            raise ValueError("GhostBatchNorm does not support momentum=None")
+
+        self.num_features = int(num_features)
+        self.num_splits = int(num_splits)
+        self.eps, self.momentum = eps, momentum
+        self.affine = affine
+        self.track_running_stats = track_running_stats
+
+        if affine:
+            self.weight = nn.Parameter(torch.ones(self.num_features, device=device, dtype=dtype))
+            self.bias   = nn.Parameter(torch.zeros(self.num_features, device=device, dtype=dtype))
+        else:
+            self.register_parameter('weight', None)
+            self.register_parameter('bias',   None)
+
+        # Per-split running stats (shape C*S)
+        self.register_buffer('running_mean', torch.zeros((self.num_splits, self.num_features), device=device, dtype=dtype))
+        self.register_buffer('running_var',  torch.ones ((self.num_splits, self.num_features), device=device, dtype=dtype))
+
+    def train(self, mode=True):
+        # On train->eval, lazily average per-split stats so eval uses global stats
+        if (self.training is True) and (mode is False):
+            with torch.no_grad():
+                self.running_mean.copy_(self.running_mean.mean(0, keepdim=True).expand_as(self.running_mean))
+                self.running_var.copy_(self.running_var .mean(0, keepdim=True).expand_as(self.running_var))
+        return super().train(mode)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.training:
+            return F.batch_norm(
+                x, self.running_mean[0], self.running_var[0],
+                self.weight, self.bias,
+                False, self.momentum, self.eps
+            )
+
+        N, C, H, W = x.shape
+        S = self.num_splits
+        assert C == self.num_features
+        assert N % S == 0, f"batch size {N} not divisible by num_splits {S}"
+
+        outs = [F.batch_norm(c, self.running_mean[i], self.running_var[i],
+            self.weight, self.bias, True, self.momentum, self.eps
+        ) for i, c in enumerate(x.chunk(S))]
+
+        return torch.cat(outs)
+
+class GBN_Chunked_v3(nn.BatchNorm2d):
+    def __init__(self, num_features: int, num_splits: int, eps: float = 1e-5, momentum: float = 0.1, affine: bool = True,
+                 track_running_stats: bool = True, device=None, dtype=None):
+        if momentum is None:
+            raise ValueError("GhostBatchNorm does not support momentum=None")
+
+        super().__init__(num_features, eps, momentum, affine, True, device, dtype)
+
+        self.num_splits = num_splits
+
+        # Per-split running stats (shape C*S)
+        self.register_buffer('running_mean', torch.zeros((self.num_splits, self.num_features), device=device, dtype=dtype))
+        self.register_buffer('running_var',  torch.ones ((self.num_splits, self.num_features), device=device, dtype=dtype))
+
+    def train(self, mode=True):
+        # On train->eval, lazily average per-split stats so eval uses global stats
+        if (self.training is True) and (mode is False):
+            with torch.no_grad():
+                self.running_mean.copy_(self.running_mean.mean(0, keepdim=True).expand_as(self.running_mean))
+                self.running_var.copy_(self.running_var .mean(0, keepdim=True).expand_as(self.running_var))
+        return super().train(mode)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.training:
+            return F.batch_norm(x, self.running_mean[0], self.running_var[0],
+                self.weight, self.bias, False, self.momentum, self.eps)
+
+        N, C, _, _ = x.shape
+        assert C == self.num_features, f"channels {C} must match num_features {self.num_features}"
+        assert N % self.num_splits == 0, f"batch size {N} not divisible by num_splits {self.num_splits}"
+
+        outs = [F.batch_norm(c, self.running_mean[i], self.running_var[i],
+            self.weight, self.bias, True, self.momentum, self.eps
+        ) for i, c in enumerate(x.chunk(self.num_splits))]
+
+        return torch.cat(outs)
+
 class BN_Page(nn.BatchNorm2d):
     def __init__(self, num_features, eps=1e-05, momentum=0.1, requires_weight=True, requires_bias=True, device=None, dtype=None):
         super().__init__(num_features, eps=eps, momentum=momentum, device=device, dtype=dtype)
@@ -197,15 +285,68 @@ class GBN_vmap(nn.BatchNorm2d):
             input.unflatten(0, (self.num_splits, -1))
         ).flatten(0, 1).to(memory_format=torch.channels_last)
 
+class GBN_vmap_v2(nn.BatchNorm2d):
+    def __init__(
+        self,
+        num_features: int,
+        num_splits: int,
+        eps: float = 1e-5,
+        momentum: float = 0.1,
+        affine: bool = True,
+        requires_weight: bool = True,
+        requires_bias: bool = True,
+        device=None,
+        dtype=None,
+    ) -> None:
+        if momentum is None:
+            raise ValueError("GhostBatchNorm does not support CMA via momentum=None")
+
+        super().__init__(num_features, eps, momentum, affine, True, device, dtype)
+        self.num_splits = num_splits
+
+        if affine:
+            self.weight.requires_grad = requires_weight
+            self.bias.requires_grad = requires_bias
+
+        self.register_buffer('running_mean', torch.zeros((self.num_splits, num_features), device=device, dtype=dtype))
+        self.register_buffer('running_var', torch.ones((self.num_splits, num_features), device=device, dtype=dtype))
+        
+        def _bn_per_split(x: torch.Tensor, rm: torch.Tensor, rv: torch.Tensor) -> torch.Tensor:
+            return F.batch_norm(x, rm, rv, self.weight, self.bias, True, self.momentum, self.eps)
+        self._bn_per_split = torch.vmap(_bn_per_split)
+
+    def train(self, mode=True):
+        # Lazily collate stats when we need to use them
+        if (self.training is True) and (mode is False):
+            with torch.no_grad():
+                self.running_mean.copy_(self.running_mean.mean(dim=0, keepdim=True).expand_as(self.running_mean))
+                self.running_var.copy_(self.running_var.mean(dim=0, keepdim=True).expand_as(self.running_var))
+        return super().train(mode)
+
+    def forward(self, input):
+        if not self.training:
+            return F.batch_norm(
+                input, self.running_mean[0], self.running_var[0],
+                self.weight, self.bias, False, 0.0, self.eps)
+
+        B = input.size(0)
+        assert B % self.num_splits == 0, f"batch size {B} not divisible by num_splits {self.num_splits}"
+        
+        return self._bn_per_split(
+            input.unflatten(0, (self.num_splits, -1)),
+            self.running_mean,
+            self.running_var,
+        ).flatten(0, 1).to(memory_format=torch.channels_last)
+
 # %%
 
 if __name__ == "__main__":
-    impls = [GBN_Vectorized, GBN_Chunked, GBN_Page, GBN_vmap]
+    impls = [GBN_Vectorized, GBN_Chunked, GBN_Chunked_v2, GBN_Chunked_v3, GBN_Page, GBN_vmap, GBN_vmap_v2]
 
     device = 'cuda'
     batch_size = 512
     ghost_batch_size = 32
-    features = 128
+    features = 512
     num_splits = batch_size // ghost_batch_size
     fmt = torch.channels_last
     dtype = torch.float16
@@ -228,7 +369,7 @@ if __name__ == "__main__":
     benchmark(
         variants=train_variants,
         make_inputs=make_inputs_train,
-        iters=1_000,
+        iters=100,
         warmup=20,
     )
 
@@ -248,7 +389,7 @@ if __name__ == "__main__":
     benchmark(
         variants=eval_variants,
         make_inputs=make_inputs_eval,
-        iters=1_000,
+        iters=100,
         warmup=20,
     )
 

@@ -64,6 +64,6 @@ def benchmark(
         print(f"{name} [eager]: median={_fmt_seconds(med)} mean={_fmt_seconds(mean)}")
 
         # Compiled
-        compiled = torch.compile(fn, mode="max-autotune")
+        compiled = torch.compile(fn, mode="max-autotune", fullgraph=True)
         med_c, mean_c = _measure(compiled, args, warmup, iters)
         print(f"{name} [compiled]: median={_fmt_seconds(med_c)} mean={_fmt_seconds(mean_c)}")
