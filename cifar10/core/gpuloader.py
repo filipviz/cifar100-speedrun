@@ -48,7 +48,8 @@ class GPULoader:
         assert self.batch_size <= 2 * self.n_images, "To support this batch size you have to update __iter__"
 
         if train:
-            @torch.compile(mode=shared_cfg.compile_mode, disable=(not shared_cfg.compile_enabled))
+            disable = not shared_cfg.compile_enabled
+            @torch.compile(mode=shared_cfg.compile_mode, fullgraph=True, disable=disable)
             def augment(images: Float[Tensor, "b c h_in w_in"]) -> Float[Tensor, "b c h_out w_out"]:
                 if cfg.crop_padding > 0:
                     images = batch_crop(images, crop_size=32)

@@ -15,8 +15,8 @@ class GBN_Vectorized(nn.BatchNorm2d):
         eps: float = 1e-5,
         momentum: float = 0.1,
         affine: bool = True,
-        weight: bool = True,
-        bias: bool = True,
+        requires_weight: bool = True,
+        requires_bias: bool = True,
         device=None,
         dtype=None,
     ) -> None:
@@ -26,8 +26,8 @@ class GBN_Vectorized(nn.BatchNorm2d):
         super().__init__(num_features, eps, momentum, affine, True, device, dtype)
         self.num_splits, self.num_features = num_splits, num_features
 
-        self.weight.requires_grad = weight
-        self.bias.requires_grad = bias
+        self.weight.requires_grad = requires_weight
+        self.bias.requires_grad = requires_bias
 
         self.register_buffer('running_mean', torch.zeros(num_features*self.num_splits, device=device, dtype=dtype))
         self.register_buffer('running_var', torch.ones(num_features*self.num_splits, device=device, dtype=dtype))
@@ -118,12 +118,12 @@ class GBN_Chunked(nn.Module):
             return y.to(memory_format=torch.channels_last)
 
 class BN_Page(nn.BatchNorm2d):
-    def __init__(self, num_features, eps=1e-05, momentum=0.1, weight=True, bias=True, device=None, dtype=None):
+    def __init__(self, num_features, eps=1e-05, momentum=0.1, requires_weight=True, requires_bias=True, device=None, dtype=None):
         super().__init__(num_features, eps=eps, momentum=momentum, device=device, dtype=dtype)
         self.weight.data.fill_(1.0)
         self.bias.data.fill_(0.0)
-        self.weight.requires_grad = weight
-        self.bias.requires_grad = bias
+        self.weight.requires_grad = requires_weight
+        self.bias.requires_grad = requires_bias
 
 class GBN_Page(BN_Page):
     """Page's implementation doesn't support channels_last, so we've slightly modified it."""
@@ -151,7 +151,51 @@ class GBN_Page(BN_Page):
                 input, self.running_mean[:self.num_features], self.running_var[:self.num_features],
                 self.weight, self.bias, False, self.momentum, self.eps)
 
+class GBN_vmap(nn.BatchNorm2d):
+    def __init__(
+        self,
+        num_features: int,
+        num_splits: int,
+        eps: float = 1e-5,
+        momentum: float = 0.1,
+        affine: bool = True,
+        requires_weight: bool = True,
+        requires_bias: bool = True,
+        device=None,
+        dtype=None,
+    ) -> None:
+        if momentum is None:
+            raise ValueError("GhostBatchNorm does not support CMA via momentum=None")
 
+        super().__init__(num_features, eps, momentum, affine, True, device, dtype)
+        self.num_splits = num_splits
+        self.gb_momentum = 1 - (1 - momentum) ** num_splits
+
+        if affine:
+            self.weight.requires_grad = requires_weight
+            self.bias.requires_grad = requires_bias
+        
+        def _bn_per_split(x: torch.Tensor) -> torch.Tensor:
+            return F.batch_norm(x, None, None, self.weight, self.bias, True, 0.0, self.eps)
+        self._bn_per_split = torch.vmap(_bn_per_split)
+
+    def forward(self, input):
+        if not self.training:
+            return F.batch_norm(
+                input, self.running_mean, self.running_var,
+                self.weight, self.bias, False, 0.0, self.eps)
+
+        B = input.size(0)
+        assert B % self.num_splits == 0, f"batch size {B} not divisible by num_splits {self.num_splits}"
+        with torch.no_grad():
+            # The updates aren't exactly equivalent to standard batchnorm.
+            v, m = torch.var_mean(input, dim=(0, -1, -2), correction=0)
+            self.running_var.lerp_(v, self.gb_momentum)
+            self.running_mean.lerp_(m, self.gb_momentum)
+        
+        return self._bn_per_split(
+            input.unflatten(0, (self.num_splits, -1))
+        ).flatten(0, 1).to(memory_format=torch.channels_last)
 
 # %%
 

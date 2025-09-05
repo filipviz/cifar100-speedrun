@@ -124,8 +124,7 @@ class MyrtleResnet(torch.nn.Module):
 
 if __name__ == "__main__":
     assert torch.cuda.is_available(), "This script requires a CUDA-enabled GPU."
-    # torch._logging.set_logs(recompiles=True, dynamic=True, graph_breaks=True)
-
+    
     batch_size = 512
     steps_per_epoch = (50_000 + batch_size - 1) // batch_size
     train_steps = steps_per_epoch * 20
