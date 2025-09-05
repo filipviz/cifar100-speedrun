@@ -200,6 +200,8 @@ class GBN_vmap(nn.BatchNorm2d):
 # %%
 
 if __name__ == "__main__":
+    impls = [GBN_Vectorized, GBN_Chunked, GBN_Page, GBN_vmap]
+
     device = 'cuda'
     batch_size = 512
     ghost_batch_size = 32
@@ -215,7 +217,7 @@ if __name__ == "__main__":
     bn_train = nn.BatchNorm2d(features, device=device, dtype=dtype).train()
     train_variants.append(("BatchNorm2d.train", bn_train))
 
-    for impl in [GBN_Vectorized, GBN_Chunked, GBN_Page]:
+    for impl in impls:
         gbn = impl(num_features=features, num_splits=num_splits, device=device, dtype=dtype).train()
         train_variants.append((f"{impl.__name__}.train", gbn))
 
@@ -235,7 +237,7 @@ if __name__ == "__main__":
     bn_eval = nn.BatchNorm2d(features, device=device, dtype=dtype).eval()
     eval_variants.append(("BatchNorm2d.eval", bn_eval))
 
-    for impl in [GBN_Vectorized, GBN_Chunked, GBN_Page]:
+    for impl in impls:
         gbn = impl(num_features=features, num_splits=num_splits, device=device, dtype=dtype).eval()
         eval_variants.append((f"{impl.__name__}.eval", gbn))
 
@@ -253,7 +255,7 @@ if __name__ == "__main__":
     # Basic correctness checks for ghost BN variants
     bn = nn.BatchNorm2d(features, device=device, dtype=dtype)
     y_bn = bn(x)
-    for impl in [GBN_Vectorized, GBN_Chunked, GBN_Page]:
+    for impl in impls:
         gbn = impl(num_features=features, num_splits=num_splits, device=device, dtype=dtype)
         y_gbn = gbn(x)
         assert x.is_contiguous(memory_format=fmt), f"{x.is_contiguous(memory_format=fmt)=}"
