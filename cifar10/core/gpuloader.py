@@ -49,7 +49,9 @@ class GPULoader:
 
         if train:
             disable = not shared_cfg.compile_enabled
-            @torch.compile(mode=shared_cfg.compile_mode, fullgraph=True, disable=disable)
+            # With cudagraphs enabled we have to clone the output, resulting in a net performance hit.
+            @torch.compile(mode='max-autotune-no-cudagraphs', fullgraph=True, disable=disable)
+            @torch.no_grad()
             def augment(images: Float[Tensor, "b c h_in w_in"]) -> Float[Tensor, "b c h_out w_out"]:
                 if cfg.crop_padding > 0:
                     images = batch_crop(images, crop_size=32)
@@ -79,24 +81,26 @@ class GPULoader:
             return
 
         indices = torch.randperm(self.n_images, device=self.device)
+        aug_images = self.augment(self.images)
         while True:
             last_batch = position + self.batch_size > self.n_images
             # If we need to wrap around, we combine remaining indices with indices from the new epoch.
+            # We re-use a few augmentations corresponding to the remaining indices.
             if last_batch:
                 remaining = indices[position:]
                 indices = torch.randperm(self.n_images, device=self.device)
                 needed = self.batch_size - len(remaining)
                 batch_indices = torch.cat([remaining, indices[:needed]])
                 position = needed
+                aug_images = self.augment(self.images)
             else:
                 # Otherwise, we take the next batch of indices from the current epoch.
                 batch_indices = indices[position:position + self.batch_size]
                 position += self.batch_size
 
-            images = self.images[batch_indices]
+            images = aug_images[batch_indices]
             labels = self.labels[batch_indices]
 
-            images = self.augment(images)
             yield images, labels
 
 
@@ -122,9 +126,8 @@ def batch_crop(images: Float[Tensor, "b c h_in w_in"], crop_size: int = 32) -> F
 
 def batch_flip_lr(images: Float[Tensor, "b c h w"]) -> Float[Tensor, "b c h w"]:
     """Apply random horizontal flipping to each image in the batch"""
-    flip_mask = torch.rand(len(images), device=images.device) < 0.5
-    images[flip_mask] = images[flip_mask].flip(-1)
-    return images
+    flip_mask = (torch.rand(len(images), device=images.device) < 0.5).view(-1, 1, 1, 1)
+    return torch.where(flip_mask, images.flip(-1), images)
 
 def batch_cutout(images: Float[Tensor, "b c h w"], size: int) -> Float[Tensor, "b c h w"]:
     """In-place vectorized cutout using advanced indexing."""

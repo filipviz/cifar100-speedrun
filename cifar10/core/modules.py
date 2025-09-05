@@ -26,8 +26,9 @@ class GhostBatchNorm(nn.BatchNorm2d):
             self.weight.requires_grad = requires_weight
             self.bias.requires_grad = requires_bias
 
-        self.register_buffer('running_mean', torch.zeros((self.num_splits, self.num_features), device=device, dtype=dtype))
-        self.register_buffer('running_var',  torch.ones ((self.num_splits, self.num_features), device=device, dtype=dtype))
+        # nn.BatchNorm2d uses float32 for running_mean and running_var.
+        self.register_buffer('running_mean', torch.zeros((self.num_splits, self.num_features), device=device, dtype=torch.float32))
+        self.register_buffer('running_var',  torch.ones ((self.num_splits, self.num_features), device=device, dtype=torch.float32))
 
     def train(self, mode=True):
         # Lazily collate stats when we need to use them

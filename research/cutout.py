@@ -59,9 +59,9 @@ def batch_cutout_mask(images: Float[Tensor, "b c h w"], size: int) -> Float[Tens
     ws = torch.arange(w, device=dev).view(1, 1, 1, w)
 
     mask = (hs >= min_h) & (hs < max_h) & (ws >= min_w) & (ws < max_w)
-    images.masked_fill_(mask, 0)
-
-    return images
+    # images.masked_fill_(mask, 0)
+    # Using where maintains compatibility with torch.compile
+    return torch.where(mask, 0, images)
 
 def batch_cutout_sparse(images: Float[Tensor, "b c h w"], size: int) -> Float[Tensor, "b c h w"]:
     """Vectorized cutout using advanced indexing."""

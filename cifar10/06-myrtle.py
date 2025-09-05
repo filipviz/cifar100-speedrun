@@ -133,7 +133,7 @@ if __name__ == "__main__":
     cfg = ExperimentCfg(
         shared=SharedCfg(
             compile_enabled=True,
-            compile_mode='default',
+            compile_mode='max-autotune',
         ),
         trainer=TrainerCfg(
             train_steps=train_steps,

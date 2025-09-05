@@ -14,11 +14,12 @@ def batch_flip_naive(images: Float[Tensor, "b c h w"]) -> Float[Tensor, "b c h w
     flip_mask = (torch.rand(len(images), device=images.device) < 0.5).view(-1, 1, 1, 1)
     return torch.where(flip_mask, images.flip(-1), images)
 
-def batch_flip_bool(images: Float[Tensor, "b c h w"]) -> Float[Tensor, "b c h w"]:
-    b = images.size(0)
-    flip_mask = torch.rand(b, device=images.device) < 0.5
-    images[flip_mask] = images[flip_mask].flip(-1)
-    return images
+# Boolean masking doesn't work with torch.compile
+# def batch_flip_bool(images: Float[Tensor, "b c h w"]) -> Float[Tensor, "b c h w"]:
+#     b = images.size(0)
+#     flip_mask = torch.rand(b, device=images.device) < 0.5
+#     images[flip_mask] = images[flip_mask].flip(-1)
+#     return images
 
 def batch_flip_gather(images: Float[Tensor, "b c h w"]) -> Float[Tensor, "b c h w"]:
     b, c, h, w = images.shape
@@ -49,7 +50,7 @@ if __name__ == '__main__':
 
     variants = [
         ("batch_flip_naive", batch_flip_naive),
-        ("batch_flip_bool", batch_flip_bool),
+        # ("batch_flip_bool", batch_flip_bool),
         ("batch_flip_gather", batch_flip_gather),
     ]
 

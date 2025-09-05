@@ -49,7 +49,7 @@ class Trainer:
         self.scheduler = make_scheduler(self.opt)
 
         if shared_cfg.compile_enabled:
-            self.model.compile(mode=shared_cfg.compile_mode)
+            self.model.compile(mode=shared_cfg.compile_mode, fullgraph=True)
             self.opt.step = torch.compile(self.opt.step, mode=shared_cfg.compile_mode)
             self.scheduler.step = torch.compile(self.scheduler.step, mode=shared_cfg.compile_mode)
 
@@ -114,21 +114,26 @@ class Trainer:
                         'step': step,
                     }, os.path.join(self.checkpoint_dir, f"{self.run_id}-step-{step}.pt"))
 
-                self.model.eval()
-                test_metrics = self.evaluate()
-                self.model.train()
+                with torch.no_grad():
+                    # Clone to avoid accessing tensor output of CUDAGraphs.
+                    pred = pred.clone()
 
-                # Our trainining metrics are only estimates (computed on a single batch).
-                metrics = {
-                    "step": step,
-                    "time": training_time,
-                    "interval": interval_time,
-                    "lr": self.scheduler.get_last_lr()[0],
-                    "train_loss": loss.item(),
-                    "train_acc1": (pred.argmax(dim=1) == labels).float().mean().item(),
-                    "train_acc5": (pred.topk(5)[1] == labels.view(-1, 1)).any(dim=1).float().mean().item(),
-                    **test_metrics,
-                }
+                    self.model.eval()
+                    test_metrics = self.evaluate()
+                    self.model.train()
+
+                    # Our trainining metrics are only estimates (computed on a single batch).
+                    metrics = {
+                        "step": step,
+                        "time": training_time,
+                        "interval": interval_time,
+                        "lr": self.scheduler.get_last_lr()[0],
+                        "train_loss": loss.item(),
+                        "train_acc1": (pred.argmax(dim=1) == labels).float().mean().item(),
+                        "train_acc5": (pred.topk(5)[1] == labels.view(-1, 1)).any(dim=1).float().mean().item(),
+                        **test_metrics,
+                    }
+
                 logging.info(ROW_FMT.format(*[metrics[col] for col in LOGGING_COLUMNS]))
                 pbar.set_postfix(train_loss=metrics['train_loss'], test_loss=metrics['test_loss'])
 
