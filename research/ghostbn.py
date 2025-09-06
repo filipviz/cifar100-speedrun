@@ -176,7 +176,7 @@ class GBN_vmap(nn.BatchNorm2d):
 
         self.register_buffer('running_mean', torch.zeros((self.num_splits, num_features), device=device, dtype=dtype))
         self.register_buffer('running_var', torch.ones((self.num_splits, num_features), device=device, dtype=dtype))
-        
+
         def _bn_per_split(x: torch.Tensor, rm: torch.Tensor, rv: torch.Tensor) -> torch.Tensor:
             return F.batch_norm(x, rm, rv, self.weight, self.bias, True, self.momentum, self.eps)
         self._bn_per_split = torch.vmap(_bn_per_split)
@@ -197,7 +197,7 @@ class GBN_vmap(nn.BatchNorm2d):
 
         B = input.size(0)
         assert B % self.num_splits == 0, f"batch size {B} not divisible by num_splits {self.num_splits}"
-        
+
         return self._bn_per_split(
             input.unflatten(0, (self.num_splits, -1)),
             self.running_mean,

@@ -57,14 +57,16 @@ class Trainer:
         if need_checkpoint_dir:
             self.checkpoint_dir = os.path.join(shared_cfg.base_dir, "checkpoints")
             os.makedirs(self.checkpoint_dir, exist_ok=True)
-        
+
         if cfg.model_warmup_steps > 0:
             logging.info(f"Warming up for {cfg.model_warmup_steps} steps")
-            checkpoint_path = self.save_checkpoint(step=self.step)
-            self.train(warmup=True)
-            self.load_checkpoint(checkpoint_path)
-            os.remove(checkpoint_path)
-    
+            try:
+                checkpoint_path = self.save_checkpoint(step=self.step)
+                self.train(warmup=True)
+                self.load_checkpoint(checkpoint_path)
+            finally:
+                os.remove(checkpoint_path)
+
     def train(self, warmup: bool = False):
         logging.info(HEADER_FMT.format(*LOGGING_COLUMNS))
         logging.info(HEADER_FMT.format(*['---' for _ in LOGGING_COLUMNS]))
@@ -75,7 +77,7 @@ class Trainer:
 
         self.model.train()
         loader_iter = iter(self.train_loader)
-        pbar = trange(self.step, steps, desc=desc, initial=self.step, total=steps)
+        pbar = trange(self.step, steps, desc=desc, initial=self.step-1, total=steps-1)
         training_time = 0.0
 
         # Start the clock.
@@ -101,7 +103,7 @@ class Trainer:
             scaler.update()
 
             # 4. Update our learning rate.
-            self.scheduler.step()
+            self.scheduler.step(step)
 
             if self.cfg.use_wandb and not warmup:
                 wandb.log({
@@ -183,20 +185,23 @@ class Trainer:
 
     def save_checkpoint(self, step: int) -> str:
         checkpoint_path = os.path.join(self.checkpoint_dir, f"{self.run_id}-step-{step}.pt")
+        sched_state = self.scheduler.state_dict()
+        sched_state.pop('step', None) # Avoid pickling the monkey-patched step method.
         torch.save({
             'model': self.model.state_dict(),
             'optimizer': self.opt.state_dict(),
-            'scheduler': self.scheduler.state_dict(),
+            'scheduler': sched_state,
             'step': step,
         }, checkpoint_path)
         logging.info(f"Wrote step {step} checkpoint to {checkpoint_path}")
         return checkpoint_path
-    
+
     def load_checkpoint(self, checkpoint_path: str):
         data = torch.load(checkpoint_path)
         self.model.load_state_dict(data['model'])
-        self.opt.load_state_dict(data['optimizer'])
+        # Load scheduler state before optimizer state to avoid overwriting the lr.
         self.scheduler.load_state_dict(data['scheduler'])
+        self.opt.load_state_dict(data['optimizer'])
         self.step = data['step']
         logging.info(f"Loaded step {self.step} checkpoint from {checkpoint_path}")
 

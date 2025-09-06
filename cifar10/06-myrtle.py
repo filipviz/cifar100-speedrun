@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from jaxtyping import Float
 import torch
 from torch import nn, optim, Tensor
+import numpy as np
 
 from core.modules import GhostBatchNorm
 from core.gpuloader import GPULoader
@@ -125,7 +126,7 @@ class MyrtleResnet(torch.nn.Module):
 if __name__ == "__main__":
     assert torch.cuda.is_available(), "This script requires a CUDA-enabled GPU."
     torch._logging.set_logs(recompiles=True)
-    
+
     batch_size = 512
     steps_per_epoch = (50_000 + batch_size - 1) // batch_size
     train_steps = steps_per_epoch * 20
@@ -161,16 +162,13 @@ if __name__ == "__main__":
         )
 
     def make_scheduler(optimizer: optim.Optimizer) -> optim.lr_scheduler.LRScheduler:
-        warmup = optim.lr_scheduler.LinearLR(
-            optimizer, start_factor=1e-8, end_factor=1.0, total_iters=lr_warmup_steps
-        )
-        decay = optim.lr_scheduler.LinearLR(
-            optimizer, start_factor=1.0, end_factor=0.0, total_iters=train_steps - lr_warmup_steps
-        )
+        milestones = (0, lr_warmup_steps, train_steps)
+        lrs = (1e-8, 1.0, 1e-8)
 
-        return optim.lr_scheduler.SequentialLR(
-            optimizer, schedulers=[warmup, decay], milestones=[lr_warmup_steps]
-        )
+        def lr_fn(step: int) -> float:
+            return np.interp(step, milestones, lrs).item()
+
+        return optim.lr_scheduler.LambdaLR(optimizer, lr_fn)
 
     ghost_batch_size = 32
     model_cfg = MyrtleCfg(
