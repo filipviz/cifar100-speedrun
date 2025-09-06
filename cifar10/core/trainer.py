@@ -10,7 +10,7 @@ from tabulate import tabulate
 import torch
 import torch.nn.functional as F
 from torch import nn, optim, Tensor
-from tqdm import tqdm
+from tqdm import tqdm, trange
 import wandb
 
 from .config import ExperimentCfg, SharedCfg, TrainerCfg
@@ -30,7 +30,7 @@ class Trainer:
         logging_is_configured = logging.getLogger().hasHandlers()
         assert logging_is_configured, "Logging must be configured before a Trainer is instantiated. Call setup_logging."
 
-        self.cfg = cfg
+        self.cfg, self.step = cfg, 1
         self.run_id, self.device = shared_cfg.run_id, shared_cfg.device
         self.dtype = {
             'fp16': torch.float16,
@@ -53,17 +53,29 @@ class Trainer:
             self.opt.step = torch.compile(self.opt.step, mode=shared_cfg.compile_mode)
             self.scheduler.step = torch.compile(self.scheduler.step, mode=shared_cfg.compile_mode)
 
-        if self.cfg.save_every > 0:
+        need_checkpoint_dir = self.cfg.checkpoint_every > 0 or self.cfg.model_warmup_steps > 0
+        if need_checkpoint_dir:
             self.checkpoint_dir = os.path.join(shared_cfg.base_dir, "checkpoints")
             os.makedirs(self.checkpoint_dir, exist_ok=True)
-
-    def train(self):
+        
+        if cfg.model_warmup_steps > 0:
+            logging.info(f"Warming up for {cfg.model_warmup_steps} steps")
+            checkpoint_path = self.save_checkpoint(step=self.step)
+            self.train(warmup=True)
+            self.load_checkpoint(checkpoint_path)
+            os.remove(checkpoint_path)
+    
+    def train(self, warmup: bool = False):
         logging.info(HEADER_FMT.format(*LOGGING_COLUMNS))
         logging.info(HEADER_FMT.format(*['---' for _ in LOGGING_COLUMNS]))
+        if warmup:
+            steps, desc = self.cfg.model_warmup_steps + 1, "warmup"
+        else:
+            steps, desc = self.cfg.train_steps + 1, "training"
 
         self.model.train()
         loader_iter = iter(self.train_loader)
-        pbar = tqdm(range(1, self.cfg.train_steps+1), desc="Training")
+        pbar = trange(self.step, steps, desc=desc, initial=self.step, total=steps)
         training_time = 0.0
 
         # Start the clock.
@@ -91,28 +103,24 @@ class Trainer:
             # 4. Update our learning rate.
             self.scheduler.step()
 
-            if self.cfg.use_wandb:
+            if self.cfg.use_wandb and not warmup:
                 wandb.log({
                     'train_loss': loss.item(),
                     'lr': self.scheduler.get_last_lr()[0],
                 }, step)
 
             # ---- Evaluation ---- #
-            last_step = step == self.cfg.train_steps
-            if last_step or self.cfg.eval_every > 0 and step % self.cfg.eval_every == 0:
+            last_step = step + 1 == steps
+            eval_step = self.cfg.eval_every > 0 and step % self.cfg.eval_every == 0
+            if last_step or eval_step:
                 torch.cuda.synchronize()
                 interval_time = time.perf_counter() - t0
                 training_time += interval_time
 
-                # Save a checkpoint.
-                if self.cfg.save_every > 0 and (
-                    last_step or step % self.cfg.save_every == 0
-                ):
-                    torch.save({
-                        'model': self.model.state_dict(),
-                        'optimizer': self.opt.state_dict(),
-                        'step': step,
-                    }, os.path.join(self.checkpoint_dir, f"{self.run_id}-step-{step}.pt"))
+                checkpoint_enabled = self.cfg.checkpoint_every > 0 and not warmup
+                checkpoint_step = checkpoint_enabled and (last_step or step % self.cfg.checkpoint_every == 0)
+                if checkpoint_step:
+                    self.save_checkpoint(step)
 
                 with torch.no_grad():
                     # Clone to avoid accessing tensor output of CUDAGraphs.
@@ -137,7 +145,7 @@ class Trainer:
                 logging.info(ROW_FMT.format(*[metrics[col] for col in LOGGING_COLUMNS]))
                 pbar.set_postfix(train_loss=metrics['train_loss'], test_loss=metrics['test_loss'])
 
-                if self.cfg.use_wandb:
+                if self.cfg.use_wandb and not warmup:
                     del metrics['step']
                     wandb.log(metrics, step)
 
@@ -147,7 +155,7 @@ class Trainer:
 
         torch.cuda.synchronize()
         training_time += time.perf_counter() - t0
-        logging.info(f"Total training time: {training_time:,.2f}s")
+        logging.info(f"Total {desc} time: {training_time:,.2f}s")
 
     @torch.inference_mode()
     def evaluate(self) -> dict[str, float]:
@@ -157,7 +165,7 @@ class Trainer:
         n_correct_top1 = torch.tensor(0.0, device=self.device)
         n_correct_top5 = torch.tensor(0.0, device=self.device)
 
-        pbar = tqdm(self.test_loader, desc="Evaluating", position=1, leave=False)
+        pbar = tqdm(self.test_loader, desc="evaluating", position=1, leave=False)
         for batch, labels in pbar:
             with torch.autocast(self.device, dtype=self.dtype, enabled=self.autocast_enabled):
                 pred = self.model(batch)
@@ -172,6 +180,26 @@ class Trainer:
             "test_acc1": n_correct_top1.item() / items,
             "test_acc5": n_correct_top5.item() / items,
         }
+
+    def save_checkpoint(self, step: int) -> str:
+        checkpoint_path = os.path.join(self.checkpoint_dir, f"{self.run_id}-step-{step}.pt")
+        torch.save({
+            'model': self.model.state_dict(),
+            'optimizer': self.opt.state_dict(),
+            'scheduler': self.scheduler.state_dict(),
+            'step': step,
+        }, checkpoint_path)
+        logging.info(f"Wrote step {step} checkpoint to {checkpoint_path}")
+        return checkpoint_path
+    
+    def load_checkpoint(self, checkpoint_path: str):
+        data = torch.load(checkpoint_path)
+        self.model.load_state_dict(data['model'])
+        self.opt.load_state_dict(data['optimizer'])
+        self.scheduler.load_state_dict(data['scheduler'])
+        self.step = data['step']
+        logging.info(f"Loaded step {self.step} checkpoint from {checkpoint_path}")
+
 
 # --- Logging Utilities --- #
 # Call setup_logging before initializing a Trainer, and finish_logging after training is complete.

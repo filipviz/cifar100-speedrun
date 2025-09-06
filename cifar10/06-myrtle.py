@@ -124,11 +124,12 @@ class MyrtleResnet(torch.nn.Module):
 
 if __name__ == "__main__":
     assert torch.cuda.is_available(), "This script requires a CUDA-enabled GPU."
+    torch._logging.set_logs(recompiles=True)
     
     batch_size = 512
     steps_per_epoch = (50_000 + batch_size - 1) // batch_size
     train_steps = steps_per_epoch * 20
-    warmup_steps = train_steps // 5
+    lr_warmup_steps = train_steps // 5
 
     cfg = ExperimentCfg(
         shared=SharedCfg(
@@ -139,6 +140,7 @@ if __name__ == "__main__":
             train_steps=train_steps,
             eval_every=steps_per_epoch,
             label_smoothing=0.2,
+            model_warmup_steps=10,
         ),
         loader=GPULoaderCfg(
             batch_size=batch_size,
@@ -160,14 +162,14 @@ if __name__ == "__main__":
 
     def make_scheduler(optimizer: optim.Optimizer) -> optim.lr_scheduler.LRScheduler:
         warmup = optim.lr_scheduler.LinearLR(
-            optimizer, start_factor=1e-8, end_factor=1.0, total_iters=warmup_steps
+            optimizer, start_factor=1e-8, end_factor=1.0, total_iters=lr_warmup_steps
         )
         decay = optim.lr_scheduler.LinearLR(
-            optimizer, start_factor=1.0, end_factor=0.0, total_iters=train_steps - warmup_steps
+            optimizer, start_factor=1.0, end_factor=0.0, total_iters=train_steps - lr_warmup_steps
         )
 
         return optim.lr_scheduler.SequentialLR(
-            optimizer, schedulers=[warmup, decay], milestones=[warmup_steps]
+            optimizer, schedulers=[warmup, decay], milestones=[lr_warmup_steps]
         )
 
     ghost_batch_size = 32

@@ -22,9 +22,11 @@ class TrainerCfg:
     # --- Training --- #
     train_steps: int = 1_500
     "Number of mini-batch iterations we train for."
+    model_warmup_steps: int = 0
+    "Number of (untimed) iterations to warm up for. Use when enabling torch.compile."
     eval_every: int = 100
     "Set to 0 to disable evaluation."
-    save_every: int = 0
+    checkpoint_every: int = 0
     "Set to 0 to disable checkpointing. Must be a multiple of eval_every."
 
     label_smoothing: float = 0.0
@@ -39,7 +41,7 @@ class TrainerCfg:
 
     def __post_init__(self):
         if self.eval_every > 0:
-            assert self.save_every % self.eval_every == 0, "save_every must be a multiple of eval_every"
+            assert self.checkpoint_every % self.eval_every == 0, "checkpoint_every must be a multiple of eval_every"
         if self.use_wandb:
             assert self.wandb_project, "Must specify a wandb_project"
 
