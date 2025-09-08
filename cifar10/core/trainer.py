@@ -51,7 +51,6 @@ class Trainer:
         if shared_cfg.compile_enabled:
             self.model.compile(mode=shared_cfg.compile_mode, fullgraph=True)
             self.opt.step = torch.compile(self.opt.step, mode=shared_cfg.compile_mode)
-            self.scheduler.step = torch.compile(self.scheduler.step, mode=shared_cfg.compile_mode)
 
         need_checkpoint_dir = self.cfg.checkpoint_every > 0 or self.cfg.model_warmup_steps > 0
         if need_checkpoint_dir:
@@ -103,7 +102,7 @@ class Trainer:
             scaler.update()
 
             # 4. Update our learning rate.
-            self.scheduler.step(step)
+            self.scheduler.step()
 
             if self.cfg.use_wandb and not warmup:
                 wandb.log({

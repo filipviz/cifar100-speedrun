@@ -16,6 +16,7 @@ class GPULoader:
     def __init__(self, train: bool, cfg: GPULoaderCfg, shared_cfg: SharedCfg):
         self.cfg = cfg
         self.batch_size, self.train = cfg.batch_size, train
+        self.pad_last_batch = shared_cfg.compile_enabled
 
         self.device = shared_cfg.device
         data_dir = os.path.join(shared_cfg.base_dir, 'data')
@@ -77,7 +78,16 @@ class GPULoader:
                 images = self.images[position:next_position]
                 labels = self.labels[position:next_position]
                 position = next_position
+                
+                # To avoid recompilation, we may need to pad the last test batch
+                if self.pad_last_batch and images.size(0) < self.batch_size:
+                    padding_needed = self.batch_size - images.size(0)
+                    cross_entropy_ignore_idx = -100
+                    labels = F.pad(labels, (0, padding_needed), value=cross_entropy_ignore_idx)
+                    images = F.pad(images, (0, 0) * 3 + (0, padding_needed))
+
                 yield images, labels
+
             return
 
         indices = torch.randperm(self.n_images, device=self.device)

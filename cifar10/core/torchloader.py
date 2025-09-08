@@ -17,6 +17,7 @@ class TorchLoader:
         self.cfg = cfg
         self.train, self.device = train, shared_cfg.device
         self.data_dir = os.path.join(shared_cfg.base_dir, 'data')
+        self.batch_size = cfg.batch_size
 
         # --- Transformations --- #
         crop = train and cfg.crop_padding > 0
