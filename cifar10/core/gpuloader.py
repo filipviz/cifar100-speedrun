@@ -78,7 +78,7 @@ class GPULoader:
                 images = self.images[position:next_position]
                 labels = self.labels[position:next_position]
                 position = next_position
-                
+
                 # To avoid recompilation, we may need to pad the last test batch
                 if self.pad_last_batch and images.size(0) < self.batch_size:
                     padding_needed = self.batch_size - images.size(0)

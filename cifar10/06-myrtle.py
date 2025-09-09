@@ -1,6 +1,5 @@
 # %%
 from dataclasses import dataclass, field
-import sys
 
 from jaxtyping import Float
 import torch
@@ -158,8 +157,8 @@ if __name__ == "__main__":
         other_params = [param for name, param in model.named_parameters() if 'bn' not in name and param.requires_grad]
 
         param_groups = [{'params': other_params}, {
-            'params': norm_biases, 
-            'lr': torch.tensor(max_lr * 64), 
+            'params': norm_biases,
+            'lr': torch.tensor(max_lr * 64),
             'weight_decay': weight_decay / 64,
         }]
 

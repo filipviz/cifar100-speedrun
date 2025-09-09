@@ -2,7 +2,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn, Tensor
 from jaxtyping import Float
-from einops import einsum
 
 class GhostBatchNorm(nn.BatchNorm2d):
     """Ghost BatchNorm using a naive chunked approach. Batch size must be divisible by num_splits (set drop_last=True)."""
@@ -61,8 +60,8 @@ class GhostBatchNorm(nn.BatchNorm2d):
         ) for i, c in enumerate(x.chunk(self.num_splits))]
         return torch.cat(outs)
 
+
 class PCAWhiteningBlock(nn.Module):
-    # TODO: wip - likely still has bugs
     def __init__(self, c_in: int, c_out: int, images: Float[Tensor, "b c h w"]):
         super().__init__()
         patch_size = 3
@@ -79,25 +78,30 @@ class PCAWhiteningBlock(nn.Module):
                 self._pca_weights(images[:5_000, :, 4:-4, 4:-4], patch_size)
             )
             self.whitener.weight.requires_grad_(False)
-        
+
     @staticmethod
     @torch.inference_mode()
     def _pca_weights(
         images: Float[Tensor, "b c h w"],
         size: int = 3,
-        eps: float = 1e-3
+        eps: float = 1e-2
     ) -> Float[Tensor, "d c size size"]:
+        """Produce the PCA-whitening convolution weights based on the input images."""
         c = images.size(1)
         h = w = size
-        patches = images.unfold(2, h, 1).unfold(3, w, 1).transpose(1, 3).reshape(-1, c*h*w).T
-        sigma = torch.cov(patches)
-        eigenvalues, eigenvectors = torch.linalg.eigh(sigma)
-        
-        W = einsum(eigenvectors, (eigenvalues + eps).rsqrt(),
-            'chw d, d -> d chw',).reshape(-1, c, h, w)
+        d = c * h * w
 
-        return W
-    
+        # $X \in \mathbb{R}^{d \times N}$
+        patches = images.unfold(2, h, 1).unfold(3, w, 1).transpose(1, 3).reshape(-1, d).T
+        # $\Sigma = E[X X^T] \in \mathbb{R}^{d \times d}$
+        sigma = torch.cov(patches)
+        # $Q \Lambda Q^T = \Sigma$
+        evals, evecs = torch.linalg.eigh(sigma)
+        # $W_\text{pca} = \Lambda^{-1/2} Q^T$
+        W = (evals + eps).rsqrt().diag() @ evecs.T
+
+        return W.reshape(d, c, h, w)
+
     def forward(self, x: Float[Tensor, "b c_in h w"]) -> Float[Tensor, "b c_out h w"]:
         out = self.whitener(x)
         out = self.pointwise(out)
