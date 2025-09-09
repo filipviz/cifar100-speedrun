@@ -127,8 +127,9 @@ if __name__ == "__main__":
 
     batch_size = 512
     steps_per_epoch = (50_000 + batch_size - 1) // batch_size
-    train_steps = steps_per_epoch * 17
+    train_steps = steps_per_epoch * 13
     lr_warmup_steps = train_steps // 5
+    lr_ema_steps = steps_per_epoch * 2
 
     cfg = ExperimentCfg(
         shared=SharedCfg(
@@ -140,9 +141,12 @@ if __name__ == "__main__":
             eval_every=steps_per_epoch,
             label_smoothing=0.2,
             model_warmup_steps=10,
+            ema_update_every=5,
+            ema_decay=0.99**5,
         ),
         loader=GPULoaderCfg(
             batch_size=batch_size,
+            cutout_size=5,
         ),
     )
 
@@ -150,7 +154,7 @@ if __name__ == "__main__":
     test_loader = GPULoader(False, cfg.loader, cfg.shared)
 
     def make_optimizer(model: nn.Module) -> optim.Optimizer:
-        max_lr = 0.4
+        max_lr = 0.6
         weight_decay = 5e-4
 
         norm_biases = [param for name, param in model.named_parameters() if 'bn' in name and param.requires_grad]
@@ -172,8 +176,8 @@ if __name__ == "__main__":
         )
 
     def make_scheduler(optimizer: optim.Optimizer) -> optim.lr_scheduler.LRScheduler:
-        milestones = (0, lr_warmup_steps, train_steps)
-        lrs = (1e-8, 1.0, 1e-8)
+        milestones = (0, lr_warmup_steps, train_steps - lr_ema_steps)
+        lrs = (1e-8, 1.0, 0.1)
 
         def lr_fn(step: int) -> float:
             return np.interp(step, milestones, lrs).item()

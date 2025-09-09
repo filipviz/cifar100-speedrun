@@ -6,12 +6,13 @@ import time
 from dataclasses import dataclass
 from collections.abc import Iterable, Callable
 
-from tabulate import tabulate
 import torch
 import torch.nn.functional as F
 from torch import nn, optim, Tensor
+from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn, update_bn
 from tqdm import tqdm, trange
 import wandb
+from tabulate import tabulate
 
 from .config import ExperimentCfg, SharedCfg, TrainerCfg
 
@@ -66,6 +67,11 @@ class Trainer:
             finally:
                 os.remove(checkpoint_path)
 
+        self.ema_model = AveragedModel(
+            self.model, device=self.device,
+            multi_avg_fn=get_ema_multi_avg_fn(decay=self.cfg.ema_decay),
+        ) if self.cfg.ema_update_every > 0 else None
+
     def train(self, warmup: bool = False):
         logging.info(HEADER_FMT.format(*LOGGING_COLUMNS))
         logging.info(HEADER_FMT.format(*['---' for _ in LOGGING_COLUMNS]))
@@ -103,12 +109,17 @@ class Trainer:
 
             # 4. Update our learning rate.
             self.scheduler.step()
+            
+            if not warmup:
+                # 5. If we have an EMA model, update it.
+                if self.cfg.ema_update_every > 0 and step % self.cfg.ema_update_every == 0:
+                    self.ema_model.update_parameters(self.model)
 
-            if self.cfg.use_wandb and not warmup:
-                wandb.log({
-                    'train_loss': loss.item(),
-                    'lr': self.scheduler.get_last_lr()[0],
-                }, step)
+                if self.cfg.use_wandb:
+                    wandb.log({
+                        'train_loss': loss.item(),
+                        'lr': self.scheduler.get_last_lr()[0],
+                    }, step)
 
             # ---- Evaluation ---- #
             last_step = step + 1 == steps
@@ -153,14 +164,27 @@ class Trainer:
                 # Start the clock again.
                 torch.cuda.synchronize()
                 t0 = time.perf_counter()
-
+                
         torch.cuda.synchronize()
         training_time += time.perf_counter() - t0
         logging.info(f"Total {desc} time: {training_time:,.2f}s")
 
+        if not warmup and self.ema_model is not None:
+            t0 = time.perf_counter()
+            # TODO: We're updating the EMA bn stats with test since train is infinite.
+            update_bn(self.test_loader, self.ema_model, device=self.device)
+            logging.info(f"Took {time.perf_counter() - t0:,.2f}s to update EMA model BN stats")
+            self.ema_model.eval()
+            stats = self.evaluate(self.ema_model)
+            test_loss, test_acc1, test_acc5 = stats['test_loss'], stats['test_acc1'], stats['test_acc5']
+            logging.info(f"EMA model had {test_loss=:.3f}, {test_acc1=:.3%}, and {test_acc5=:.3%}")
+
+
     @torch.inference_mode()
-    def evaluate(self) -> dict[str, float]:
-        assert not self.model.training, "Model must be in eval mode"
+    def evaluate(self, model: nn.Module = None) -> dict[str, float]:
+        if model is None:
+            model = self.model
+        assert not model.training, "Model must be in eval mode"
         items = self.test_loader.n_images
         cum_loss = torch.tensor(0.0, device=self.device)
         n_correct_top1 = torch.tensor(0.0, device=self.device)
@@ -169,7 +193,7 @@ class Trainer:
         pbar = tqdm(self.test_loader, desc="evaluating", position=1, leave=False)
         for batch, labels in pbar:
             with torch.autocast(self.device, dtype=self.dtype, enabled=self.autocast_enabled):
-                pred = self.model(batch)
+                pred = model(batch)
                 loss = F.cross_entropy(pred, labels, reduction="sum")
 
             cum_loss += loss

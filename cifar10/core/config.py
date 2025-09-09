@@ -32,6 +32,10 @@ class TrainerCfg:
     label_smoothing: float = 0.0
     "Label smoothing epsilon. Set to 0 to disable."
 
+    ema_update_every: int = 0
+    "We update the EMA model every n steps. Set to 0 to disable."
+    ema_decay: float = 0.99
+
     # --- Wandb --- #
     use_wandb: bool = False
     wandb_project: str = "cifar10"
