@@ -1,12 +1,13 @@
 # %%
 from dataclasses import dataclass, field
+import sys
 
 from jaxtyping import Float
 import torch
 from torch import nn, optim, Tensor
 import numpy as np
 
-from core.modules import GhostBatchNorm
+from core.modules import GhostBatchNorm, PCAWhiteningBlock
 from core.gpuloader import GPULoader
 from core.trainer import Trainer, finish_logging, setup_logging
 from core.config import ExperimentCfg, GPULoaderCfg, SharedCfg, TrainerCfg
@@ -39,7 +40,7 @@ class MyrtleCfg:
     "Whether each group has a residual block."
     fc_scale: float = 0.125
     "We scale the activations by this amount before the softmax."
-    celu_alpha: float = 0.075
+    celu_alpha: float = 0.075 * 4
     num_splits: int = 16
     "The number of ghost batches to use for GhostBatchNorm. Should be batch_size // ghost_batch_size."
 
@@ -68,15 +69,15 @@ class MyrtleBlock(nn.Module):
 
         self.conv1 = nn.Conv2d(c_in, c_out, 3, padding=1, bias=False)
         self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
-        self.gbn1 = GhostBatchNorm(c_out, num_splits=num_splits)
+        self.gbn1 = GhostBatchNorm(c_out, num_splits=num_splits, requires_weight=False)
         self.celu = nn.CELU(alpha=celu_alpha)
 
         if residual:
             self.conv2 = nn.Conv2d(c_out, c_out, 3, padding=1, bias=False)
-            self.gbn2 = GhostBatchNorm(c_out, num_splits=num_splits)
+            self.gbn2 = GhostBatchNorm(c_out, num_splits=num_splits, requires_weight=False)
 
             self.conv3 = nn.Conv2d(c_out, c_out, 3, padding=1, bias=False)
-            self.gbn3 = GhostBatchNorm(c_out, num_splits=num_splits)
+            self.gbn3 = GhostBatchNorm(c_out, num_splits=num_splits, requires_weight=False)
 
     def forward(
         self, x: Float[Tensor, "batch c_in h_in w_in"]
@@ -92,12 +93,10 @@ class MyrtleBlock(nn.Module):
 
         return out
 
-class MyrtleResnet(torch.nn.Module):
-    def __init__(self, cfg: MyrtleCfg):
+class MyrtleResnet(nn.Module):
+    def __init__(self, cfg: MyrtleCfg, images: Float[Tensor, "b c h w"]):
         super().__init__()
-        self.conv = nn.Conv2d(3, cfg.input_conv_filters, 3, padding=1, bias=False)
-        self.gbn = GhostBatchNorm(cfg.input_conv_filters, num_splits=cfg.num_splits)
-        self.celu = nn.CELU(alpha=cfg.celu_alpha)
+        self.pca_whitener = PCAWhiteningBlock(3, cfg.input_conv_filters, images)
 
         n_groups = len(cfg.group_residual)
         c_ins = [
@@ -115,7 +114,7 @@ class MyrtleResnet(torch.nn.Module):
         self.fc_scale = cfg.fc_scale
 
     def forward(self, x: Float[Tensor, "batch channel height width"]) -> Float[Tensor, "batch n_classes"]:
-        out = self.celu(self.gbn(self.conv(x)))
+        out = self.pca_whitener(x)
         out = self.layers(out)
         out = self.pool(out).flatten(start_dim=1)
         out = self.fc(out) * self.fc_scale
@@ -129,7 +128,7 @@ if __name__ == "__main__":
 
     batch_size = 512
     steps_per_epoch = (50_000 + batch_size - 1) // batch_size
-    train_steps = steps_per_epoch * 20
+    train_steps = steps_per_epoch * 17
     lr_warmup_steps = train_steps // 5
 
     cfg = ExperimentCfg(
@@ -152,11 +151,23 @@ if __name__ == "__main__":
     test_loader = GPULoader(False, cfg.loader, cfg.shared)
 
     def make_optimizer(model: nn.Module) -> optim.Optimizer:
+        max_lr = 0.4
+        weight_decay = 5e-4
+
+        norm_biases = [param for name, param in model.named_parameters() if 'bn' in name and param.requires_grad]
+        other_params = [param for name, param in model.named_parameters() if 'bn' not in name and param.requires_grad]
+
+        param_groups = [{'params': other_params}, {
+            'params': norm_biases, 
+            'lr': torch.tensor(max_lr * 64), 
+            'weight_decay': weight_decay / 64,
+        }]
+
         return optim.SGD(
-            model.parameters(),
-            lr=torch.tensor(0.4),
+            param_groups,
+            lr=torch.tensor(max_lr),
             momentum=0.9,
-            weight_decay=5e-4,
+            weight_decay=weight_decay,
             nesterov=True,
             fused=True,
         )
@@ -174,7 +185,7 @@ if __name__ == "__main__":
     model_cfg = MyrtleCfg(
         num_splits=batch_size // ghost_batch_size
     )
-    model = MyrtleResnet(model_cfg)
+    model = MyrtleResnet(model_cfg, train_loader.images)
 
     setup_logging(cfg, model_cfg)
     trainer = Trainer(cfg.trainer, cfg.shared, train_loader, test_loader, make_optimizer, make_scheduler, model)
