@@ -17,6 +17,9 @@ class GhostBatchNorm(nn.BatchNorm2d):
         device=None,
         dtype=None,
     ) -> None:
+        if momentum is None:
+            raise ValueError("GhostBatchNorm does not support CMA via momentum=None")
+
         super().__init__(num_features, eps, momentum, affine, True, device, dtype)
         self.num_splits = num_splits
 
@@ -50,20 +53,10 @@ class GhostBatchNorm(nn.BatchNorm2d):
         assert C == self.num_features, f"channels {C} must match num_features {self.num_features}"
         assert N % self.num_splits == 0, f"batch size {N} not divisible by num_splits {self.num_splits}"
 
-        # We need nn.BatchNorm2d's momentum handling for swa_utils.update_bn to work.
-        if self.momentum is None:
-            if self.track_running_stats:
-                effective_momentum = 1.0 / float(self.num_batches_tracked + 1)
-                self.num_batches_tracked.add_(1)
-            else:
-                effective_momentum = 0.0
-        else:
-            effective_momentum = self.momentum
-
         # chunk is view-based, and we preserve the channels_last layout.
         # This ends up being faster than vectorized approaches for num_features < 512.
         outs = [F.batch_norm(c, self.running_mean[i], self.running_var[i],
-            self.weight, self.bias, True, effective_momentum, self.eps
+            self.weight, self.bias, True, self.momentum, self.eps
         ) for i, c in enumerate(x.chunk(self.num_splits))]
 
         return torch.cat(outs)

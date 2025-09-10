@@ -68,7 +68,7 @@ class Trainer:
                 os.remove(checkpoint_path)
 
         self.ema_model = AveragedModel(
-            self.model, device=self.device,
+            self.model, device=self.device, use_buffers=True,
             multi_avg_fn=get_ema_multi_avg_fn(decay=self.cfg.ema_decay),
         ) if self.cfg.ema_update_every > 0 else None
 
@@ -170,10 +170,6 @@ class Trainer:
         logging.info(f"Total {desc} time: {training_time:,.2f}s")
 
         if not warmup and self.ema_model is not None:
-            t0 = time.perf_counter()
-            # TODO: We're updating the EMA bn stats with test since train is infinite.
-            update_bn(self.test_loader, self.ema_model, device=self.device)
-            logging.info(f"Took {time.perf_counter() - t0:,.2f}s to update EMA model BN stats")
             self.ema_model.eval()
             stats = self.evaluate(self.ema_model)
             test_loss, test_acc1, test_acc5 = stats['test_loss'], stats['test_acc1'], stats['test_acc5']
